@@ -1,0 +1,32 @@
+{
+  "tenants": [
+    { "id": "tenant-a", "name": "Contoso Corp" },
+    { "id": "tenant-b", "name": "Fabrikam Dev" }
+  ],
+  "subscriptions": [
+    {
+      "id": "sub-prod-1",
+      "tenant_id": "tenant-a",
+      "name": "Production East",
+      "state": "Enabled",
+      "quota_id": "EnterpriseAgreement_2014-09-01",
+      "tags": { "Environment": "Prod" }
+    },
+    {
+      "id": "sub-msdn-1",
+      "tenant_id": "tenant-a",
+      "name": "MSDN Visual Studio Pro",
+      "state": "Enabled",
+      "quota_id": "MSDN_2014-09-01",
+      "tags": {}
+    },
+    {
+      "id": "sub-msdn-2",
+      "tenant_id": "tenant-b",
+      "name": "MSDN Test Bench",
+      "state": "Enabled",
+      "quota_id": "MSDN_2014-09-01",
+      "tags": {}
+    }
+  ]
+}

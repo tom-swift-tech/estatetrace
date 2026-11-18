@@ -1,0 +1,41 @@
+[package]
+name = "estatetrace"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "estatetrace"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+dirs = { workspace = true }
+estatetrace-azure = { workspace = true }
+estatetrace-core = { workspace = true }
+estatetrace-db = { workspace = true }
+estatetrace-integrations = { workspace = true }
+estatetrace-policy = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+mime_guess = { workspace = true }
+rand = { workspace = true }
+rust-embed = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+zip = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }

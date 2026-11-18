@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://estatetrace.local/schemas/policy_pack.schema.json",
+  "title": "EstateTrace Policy Pack",
+  "type": "object",
+  "required": ["schema_version", "id", "name", "revision", "controls"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "name": { "type": "string" },
+    "revision": { "type": "string" },
+    "owner": { "type": "string" },
+    "controls": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/control" }
+    },
+    "example_cases": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/example_case" }
+    }
+  },
+  "$defs": {
+    "control": {
+      "type": "object",
+      "required": ["id", "source", "owner", "severity", "applies_to", "check"],
+      "properties": {
+        "id": { "type": "string" },
+        "source": {
+          "type": "object",
+          "required": ["document", "revision", "clause"],
+          "properties": {
+            "document": { "type": "string" },
+            "revision": { "type": "string" },
+            "clause": { "type": "string" }
+          }
+        },
+        "owner": { "type": "string" },
+        "effective_from": { "type": "string" },
+        "severity": { "enum": ["low", "medium", "high", "critical"] },
+        "applies_to": { "type": "object" },
+        "check": {
+          "type": "object",
+          "required": ["field", "operator"],
+          "properties": {
+            "field": { "type": "string" },
+            "operator": {
+              "enum": ["exists", "nonempty", "equals", "not_equals", "in", "not_in"]
+            },
+            "value": {}
+          }
+        },
+        "azure_remediation": { "type": "object" },
+        "evidence_requirements": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "grace_period_hours": { "type": "integer" },
+        "manual": { "type": "boolean" }
+      }
+    },
+    "example_case": {
+      "type": "object",
+      "required": ["control_id", "name", "resource", "expected"],
+      "properties": {
+        "control_id": { "type": "string" },
+        "name": { "type": "string" },
+        "resource": { "type": "object" },
+        "expected": {
+          "enum": ["pass", "fail", "unknown", "inapplicable"]
+        }
+      }
+    }
+  }
+}

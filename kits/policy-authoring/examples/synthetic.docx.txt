@@ -1,0 +1,5 @@
+This file stands in for a synthetic DOCX in source control.
+
+Use kits/policy-authoring/examples/synthetic_policy.md with PROMPT.md and
+schema/policy_pack.schema.json in an approved AI tool to produce a draft pack.
+Published examples use fictional policies only.

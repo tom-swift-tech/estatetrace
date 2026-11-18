@@ -1,0 +1,80 @@
+schema_version: 1
+id: FNF-PILOT
+name: Fictional Cloud Standard Pilot
+revision: "1"
+owner: Cloud Governance
+controls:
+  - id: FIN-014
+    source: { document: "Cloud Standard", revision: "3", clause: "4.2" }
+    owner: Cloud Finance
+    effective_from: "2026-12-01"
+    severity: medium
+    applies_to: { environment: prod, capability: supports_tags }
+    check: { field: tags.CostCenter, operator: nonempty }
+    azure_remediation: { effect: modify, when: absent, inherit_from: resource_group }
+
+  - id: FIN-015
+    source: { document: "Cloud Standard", revision: "3", clause: "4.3" }
+    owner: Cloud Finance
+    severity: medium
+    applies_to: { environment: prod, capability: supports_tags }
+    check: { field: tags.CostCenter, operator: nonempty }
+    azure_remediation: { effect: modify, when: absent, inherit_from: resource_group }
+    evidence_requirements: ["Inherited tag from resource group when absent on resource"]
+
+  - id: GEO-001
+    source: { document: "Cloud Standard", revision: "3", clause: "5.1" }
+    owner: Cloud Platform
+    severity: high
+    applies_to: { environment: prod }
+    check:
+      field: location
+      operator: in
+      value: ["eastus", "eastus2", "centralus"]
+    azure_remediation: { effect: audit }
+
+  - id: LOG-010
+    source: { document: "Cloud Standard", revision: "3", clause: "6.1" }
+    owner: Cloud Security
+    severity: high
+    applies_to: { environment: prod }
+    check: { field: properties.diagnosticsWorkspace, operator: nonempty }
+    azure_remediation: { effect: deployIfNotExists }
+    grace_period_hours: 24
+
+  - id: BCP-200
+    source: { document: "Cloud Standard", revision: "3", clause: "7.4" }
+    owner: Business Continuity
+    severity: medium
+    applies_to: { environment: prod }
+    check: { field: properties.backupEnrolled, operator: equals, value: true }
+    manual: true
+    evidence_requirements:
+      - "Quarterly restore test evidence from owner"
+      - "Azure may only supply backup enrollment"
+
+example_cases:
+  - control_id: FIN-014
+    name: cost center present
+    resource: { tags: { CostCenter: "CC-100" } }
+    expected: pass
+  - control_id: FIN-014
+    name: cost center empty
+    resource: { tags: { CostCenter: "" } }
+    expected: fail
+  - control_id: FIN-014
+    name: tags unreadable
+    resource: {}
+    expected: unknown
+  - control_id: GEO-001
+    name: permitted region
+    resource: { location: eastus }
+    expected: pass
+  - control_id: GEO-001
+    name: blocked region
+    resource: { location: westus }
+    expected: fail
+  - control_id: BCP-200
+    name: manual always unknown
+    resource: { properties: { backupEnrolled: true } }
+    expected: unknown

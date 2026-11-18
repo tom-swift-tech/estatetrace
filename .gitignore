@@ -1,0 +1,13 @@
+/target
+**/target
+ui/node_modules
+ui/dist
+.DS_Store
+*.db
+*.db-wal
+*.db-shm
+.env
+.idea
+.vscode
+*.zip
+Thumbs.db
