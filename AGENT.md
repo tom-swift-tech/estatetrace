@@ -45,7 +45,8 @@ cargo run -p estatetrace -- scan
 cargo run -p estatetrace -- backup
 ```
 
-- Bind **loopback only** (`127.0.0.1`). Validate browser origins; protect mutating `/api` routes with the local session token (`x-session-token` from `/api/session`).
+- Bind **loopback only** (`127.0.0.1`). CORS and `Origin` checks allow only `http://127.0.0.1` / `http://localhost`.
+- Sensitive `/api` reads and all mutations require `x-session-token` from `/api/session`. Mutations also require a loopback (or absent) Origin. Only `/api/health` and `/api/session` are public.
 - After UI changes, rebuild `ui/` then rebuild/run the Rust binary so `rust-embed` picks up `ui/dist`.
 - Prefer targeted `cargo test -p <crate>` while iterating; run `--workspace` before claiming a milestone done.
 

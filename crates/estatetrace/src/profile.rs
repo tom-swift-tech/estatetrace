@@ -10,11 +10,3 @@ pub fn profile_dir() -> Result<PathBuf> {
     std::fs::create_dir_all(dir.join("backups"))?;
     Ok(dir)
 }
-
-pub fn db_path() -> Result<PathBuf> {
-    Ok(profile_dir()?.join("estatetrace.db"))
-}
-
-pub fn settings_path() -> Result<PathBuf> {
-    Ok(profile_dir()?.join("settings.json"))
-}

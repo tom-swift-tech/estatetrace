@@ -37,5 +37,10 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = { workspace = true }
+http-body-util = "0.1"
+
 [build-dependencies]
 anyhow = { workspace = true }

@@ -21,7 +21,8 @@ use estatetrace_policy::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tower_http::cors::{Any, CorsLayer};
+use http::HeaderValue;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use uuid::Uuid;
 
 pub fn router(state: AppState) -> Router {
@@ -73,7 +74,12 @@ pub fn router(state: AppState) -> Router {
         .fallback(static_handler)
         .layer(
             CorsLayer::new()
-                .allow_origin(Any)
+                .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
+                    origin
+                        .to_str()
+                        .map(is_loopback_origin)
+                        .unwrap_or(false)
+                }))
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
@@ -91,15 +97,23 @@ fn require_session(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCo
     }
 }
 
+fn is_loopback_origin(origin: &str) -> bool {
+    origin.starts_with("http://127.0.0.1") || origin.starts_with("http://localhost")
+}
+
 fn origin_ok(headers: &HeaderMap) -> bool {
     match headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        None => true, // same-origin navigations / tools
-        Some(o) => {
-            o.starts_with("http://127.0.0.1")
-                || o.starts_with("http://localhost")
-                || o == "null"
-        }
+        None => true, // same-origin navigations / non-browser tools
+        Some(o) => is_loopback_origin(o),
     }
+}
+
+fn require_mutation(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
+    require_session(state, headers)?;
+    if !origin_ok(headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
 }
 
 async fn health() -> Json<Value> {
@@ -114,10 +128,7 @@ async fn azure_refresh(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
-    if !origin_ok(&headers) {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    require_mutation(&state, &headers)?;
     let (tenants, subs) = discover_tenants_and_subscriptions()
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
@@ -137,7 +148,11 @@ async fn azure_refresh(
     })))
 }
 
-async fn get_scope(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+async fn get_scope(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let rows = db::resolve_effective_scope(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -157,7 +172,7 @@ async fn set_decision(
     headers: HeaderMap,
     Json(req): Json<DecisionReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     let decision = DecisionKind::parse(&req.decision).ok_or(StatusCode::BAD_REQUEST)?;
     // End prior explicit decision
     let existing = db::active_explicit_decisions(&state.pool)
@@ -188,7 +203,11 @@ async fn set_decision(
     Ok(Json(json!({ "id": row.id })))
 }
 
-async fn list_rules(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+async fn list_rules(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let rules = db::list_exclusion_rules(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -200,7 +219,7 @@ async fn save_rule(
     headers: HeaderMap,
     Json(rule): Json<ExclusionRule>,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     let mut rule = rule;
     if rule.id.is_empty() {
         rule.id = Uuid::new_v4().to_string();
@@ -216,8 +235,10 @@ async fn save_rule(
 
 async fn preview_exclusion(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(filter): Json<ExclusionFilter>,
 ) -> Result<Json<Value>, StatusCode> {
+    require_mutation(&state, &headers)?;
     let subs = db::list_subscriptions(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -240,7 +261,7 @@ async fn set_tenant_default(
     headers: HeaderMap,
     Json(req): Json<TenantDefaultReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     db::set_tenant_default(
         &state.pool,
         &TenantDefault {
@@ -253,15 +274,19 @@ async fn set_tenant_default(
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn suggestions() -> Json<Value> {
-    Json(json!({ "offers": suggested_offer_searches() }))
+async fn suggestions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
+    Ok(Json(json!({ "offers": suggested_offer_searches() })))
 }
 
 async fn trigger_scan(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     tokio::spawn({
         let state = state.clone();
         async move {
@@ -273,7 +298,11 @@ async fn trigger_scan(
     Ok(Json(json!({ "started": true })))
 }
 
-async fn list_resources(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+async fn list_resources(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let tracked = db::tracked_subscription_ids(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -299,8 +328,10 @@ async fn list_resources(State(state): State<AppState>) -> Result<Json<Value>, St
 
 async fn resource_timeline(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let decoded = urlencoding_decode(&id);
     let obs = db::latest_observation(&state.pool, &decoded)
         .await
@@ -330,14 +361,22 @@ async fn resource_timeline(
     })))
 }
 
-async fn list_changes(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+async fn list_changes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let changes = db::list_recent_changes(&state.pool, 200)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "changes": changes })))
 }
 
-async fn coverage(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+async fn coverage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let rows = db::list_coverage(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -353,8 +392,10 @@ struct InboxQuery {
 
 async fn inbox(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<InboxQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let tracked = db::tracked_subscription_ids(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -449,7 +490,11 @@ async fn inbox(
     })))
 }
 
-async fn compliance_summary(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+async fn compliance_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let evals = db::list_evaluations(&state.pool, 5000)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -477,7 +522,11 @@ async fn compliance_summary(State(state): State<AppState>) -> Result<Json<Value>
     })))
 }
 
-async fn list_class_rules(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+async fn list_class_rules(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let rules = db::list_classification_rules(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -489,14 +538,18 @@ async fn save_class_rule(
     headers: HeaderMap,
     Json(rule): Json<ClassificationRule>,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     db::upsert_classification_rule(&state.pool, &rule)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn list_packs(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+async fn list_packs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let packs = db::list_policy_packs(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -516,7 +569,7 @@ async fn import_pack(
     headers: HeaderMap,
     Json(req): Json<ImportPackReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     let pack = if let Some(y) = &req.yaml {
         parse_pack_yaml(y).map_err(|_| StatusCode::BAD_REQUEST)?
     } else if let Some(j) = &req.json {
@@ -567,7 +620,7 @@ async fn load_pilot(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     let pack = pilot_pack();
     let content = serde_json::to_value(&pack).unwrap();
     db::save_policy_pack(
@@ -590,7 +643,12 @@ async fn load_pilot(
     })))
 }
 
-async fn validate_pack(Json(body): Json<Value>) -> Result<Json<Value>, StatusCode> {
+async fn validate_pack(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    require_mutation(&state, &headers)?;
     let pack: PolicyPack = if body.get("yaml").is_some() {
         parse_pack_yaml(body["yaml"].as_str().unwrap_or("")).map_err(|_| StatusCode::BAD_REQUEST)?
     } else {
@@ -613,8 +671,10 @@ struct ExportPreviewReq {
 
 async fn export_preview(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<ExportPreviewReq>,
 ) -> Result<Json<Value>, StatusCode> {
+    require_mutation(&state, &headers)?;
     let packs = db::list_policy_packs(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -666,9 +726,10 @@ async fn create_export(
     headers: HeaderMap,
     Json(req): Json<CreateExportReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     let preview = export_preview(
         State(state.clone()),
+        headers.clone(),
         Json(ExportPreviewReq {
             pack_id: req.pack_id.clone(),
             pack_revision: req.pack_revision.clone(),
@@ -696,7 +757,11 @@ async fn create_export(
     Ok(Json(json!({ "id": id, "state": "exported", "preview": preview })))
 }
 
-async fn list_exports_api(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+async fn list_exports_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let rows = db::list_exports(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -715,7 +780,7 @@ async fn update_export(
     Path(id): Path<String>,
     Json(req): Json<UpdateExportReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     db::update_export_state(
         &state.pool,
         &id,
@@ -727,7 +792,11 @@ async fn update_export(
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn list_views_api(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+async fn list_views_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let views = db::list_views(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -739,7 +808,7 @@ async fn save_view_api(
     headers: HeaderMap,
     Json(mut view): Json<SavedView>,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     if view.id.is_empty() {
         view.id = Uuid::new_v4().to_string();
     }
@@ -750,9 +819,13 @@ async fn save_view_api(
     Ok(Json(json!({ "id": view.id })))
 }
 
-async fn get_settings(State(state): State<AppState>) -> Json<Value> {
+async fn get_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let s = state.settings.read().await.clone();
-    Json(json!({ "settings": s }))
+    Ok(Json(json!({ "settings": s })))
 }
 
 async fn update_settings(
@@ -760,7 +833,7 @@ async fn update_settings(
     headers: HeaderMap,
     Json(settings): Json<SettingsDoc>,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     *state.settings.write().await = settings;
     save_settings(&state)
         .await
@@ -768,7 +841,11 @@ async fn update_settings(
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn get_theme(State(state): State<AppState>) -> Json<Value> {
+async fn get_theme(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let settings = state.settings.read().await.clone();
     let theme = if let Some(path) = settings.theme_path {
         load_theme(std::path::Path::new(&path)).unwrap_or_else(|_| neutral_theme())
@@ -780,7 +857,7 @@ async fn get_theme(State(state): State<AppState>) -> Json<Value> {
             neutral_theme()
         }
     };
-    Json(theme_preview_payload(&theme))
+    Ok(Json(theme_preview_payload(&theme)))
 }
 
 #[derive(Deserialize)]
@@ -793,7 +870,7 @@ async fn set_theme(
     headers: HeaderMap,
     Json(req): Json<ThemeReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     let path = state.profile.join("themes/company.yaml");
     std::fs::write(&path, &req.yaml).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let theme: crate::theme::ThemeDoc =
@@ -819,7 +896,7 @@ async fn snow_test(
     headers: HeaderMap,
     Json(req): Json<SnowTestReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     ServiceNowClient::save_credentials(&req.config, &req.password)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let client = ServiceNowClient::connect(req.config.clone(), req.password);
@@ -853,7 +930,7 @@ async fn snow_disconnect(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     let url = state
         .settings
         .read()
@@ -894,7 +971,7 @@ async fn snow_refresh_queues(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     let client = snow_client(&state).await?;
     let snap = client
         .refresh_queues(Utc::now())
@@ -962,7 +1039,11 @@ async fn snow_refresh_queues(
     })))
 }
 
-async fn snow_queues(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+async fn snow_queues(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     Ok(Json(json!({
         "executed": db::get_queue_cache(&state.pool, "executed").await.unwrap_or_default(),
         "scheduled_today": db::get_queue_cache(&state.pool, "scheduled_today").await.unwrap_or_default(),
@@ -982,7 +1063,7 @@ async fn snow_lookup(
     headers: HeaderMap,
     Json(req): Json<SnowLookupReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     let tracked = db::tracked_subscription_ids(&state.pool)
         .await
         .unwrap_or_default();
@@ -1055,9 +1136,11 @@ struct ChangesBeforeQuery {
 
 async fn snow_changes_before(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(q): Query<ChangesBeforeQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
     let client = snow_client(&state).await?;
     // Load incident from cache
     let incidents = db::get_queue_cache(&state.pool, "high_priority_incidents")
@@ -1103,7 +1186,7 @@ async fn chat_test(
     headers: HeaderMap,
     Json(req): Json<ChatTestReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     ChatClient::save_credentials(&req.config, &req.key)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let client = ChatClient::connect(req.config.clone(), req.key);
@@ -1137,7 +1220,7 @@ async fn chat_disconnect(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     let url = state
         .settings
         .read()
@@ -1173,7 +1256,7 @@ async fn chat_ask(
     headers: HeaderMap,
     Json(req): Json<ChatAskReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     let cfg_val = state
         .settings
         .read()
@@ -1254,18 +1337,22 @@ async fn chat_ask(
     }
 }
 
-async fn connectors_status(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({
+async fn connectors_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
+    Ok(Json(json!({
         "servicenow": db::get_connector_status(&state.pool, "servicenow").await.ok().flatten(),
         "chat": db::get_connector_status(&state.pool, "chat").await.ok().flatten(),
-    }))
+    })))
 }
 
 async fn do_backup(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
-    require_session(&state, &headers)?;
+    require_mutation(&state, &headers)?;
     let dest = state.profile.join(format!(
         "backups/estatetrace-backup-{}.zip",
         Utc::now().format("%Y%m%dT%H%M%SZ")
@@ -1276,8 +1363,10 @@ async fn do_backup(
 
 async fn evidence_export(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    require_mutation(&state, &headers)?;
     let resource_id = body
         .get("resource_id")
         .and_then(|v| v.as_str())
@@ -1335,4 +1424,153 @@ fn urlencoding_decode(s: &str) -> String {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    async fn test_app() -> (axum::Router, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = AppState::bootstrap_in(dir.path().to_path_buf())
+            .await
+            .expect("bootstrap");
+        let token = state.session_token.clone();
+        // Keep tempdir alive by leaking path ownership into state profile only;
+        // hold dir via into_path so DB files remain for the test process lifetime.
+        let _kept = dir.keep();
+        (router(state), token)
+    }
+
+    async fn status_of(app: axum::Router, req: Request<Body>) -> StatusCode {
+        let res = app.oneshot(req).await.expect("oneshot");
+        res.status()
+    }
+
+    #[tokio::test]
+    async fn sensitive_reads_require_session() {
+        let (app, token) = test_app().await;
+        for path in [
+            "/api/resources",
+            "/api/coverage",
+            "/api/settings",
+            "/api/theme",
+            "/api/scope/exclusion-rules",
+            "/api/inbox",
+        ] {
+            let unauth = Request::builder()
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                status_of(app.clone(), unauth).await,
+                StatusCode::UNAUTHORIZED,
+                "{path} should 401 without session"
+            );
+
+            let auth = Request::builder()
+                .uri(path)
+                .header("x-session-token", &token)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                status_of(app.clone(), auth).await,
+                StatusCode::OK,
+                "{path} should 200 with session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn evidence_export_requires_session() {
+        let (app, token) = test_app().await;
+        let unauth = Request::builder()
+            .method("POST")
+            .uri("/api/evidence/export")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"resource_id":"x"}"#))
+            .unwrap();
+        assert_eq!(
+            status_of(app.clone(), unauth).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let auth = Request::builder()
+            .method("POST")
+            .uri("/api/evidence/export")
+            .header("content-type", "application/json")
+            .header("x-session-token", &token)
+            .body(Body::from(r#"{"resource_id":"x"}"#))
+            .unwrap();
+        assert_eq!(status_of(app, auth).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mutations_reject_non_loopback_origin() {
+        let (app, token) = test_app().await;
+        let bad = Request::builder()
+            .method("POST")
+            .uri("/api/scan")
+            .header("x-session-token", &token)
+            .header("origin", "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status_of(app.clone(), bad).await, StatusCode::FORBIDDEN);
+
+        let good = Request::builder()
+            .method("POST")
+            .uri("/api/scan")
+            .header("x-session-token", &token)
+            .header("origin", "http://127.0.0.1:8787")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status_of(app, good).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_and_session_remain_public() {
+        let (app, token) = test_app().await;
+        assert_eq!(
+            status_of(
+                app.clone(),
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await,
+            StatusCode::OK
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["token"].as_str().unwrap(), token);
+    }
+
+    #[test]
+    fn origin_helper_accepts_loopback_only() {
+        let mut headers = HeaderMap::new();
+        assert!(origin_ok(&headers));
+        headers.insert("origin", "http://127.0.0.1:8787".parse().unwrap());
+        assert!(origin_ok(&headers));
+        headers.insert("origin", "http://localhost:5173".parse().unwrap());
+        assert!(origin_ok(&headers));
+        headers.insert("origin", "https://evil.example".parse().unwrap());
+        assert!(!origin_ok(&headers));
+        headers.insert("origin", "null".parse().unwrap());
+        assert!(!origin_ok(&headers));
+    }
 }
