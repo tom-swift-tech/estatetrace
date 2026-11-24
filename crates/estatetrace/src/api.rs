@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use estatetrace_azure::{discover_tenants_and_subscriptions, suggested_offer_searches};
 use estatetrace_core::*;
 use estatetrace_db as db;
@@ -43,6 +43,8 @@ pub fn router(state: AppState) -> Router {
         .route("/coverage", get(coverage))
         .route("/inbox", get(inbox))
         .route("/compliance", get(compliance_summary))
+        .route("/exceptions", get(list_exceptions_api).post(create_exception))
+        .route("/dispositions", get(list_dispositions_api).post(create_disposition))
         .route("/classification/rules", get(list_class_rules).post(save_class_rule))
         .route("/packs", get(list_packs).post(import_pack))
         .route("/packs/pilot", post(load_pilot))
@@ -352,10 +354,24 @@ async fn resource_timeline(
     let coverage = db::list_coverage(&state.pool)
         .await
         .unwrap_or_default();
+    let now = Utc::now();
+    let triage = triage_with_history(&evals, now);
+    let exceptions = db::list_exceptions(&state.pool, Some(&decoded))
+        .await
+        .unwrap_or_default();
+    let mut dispositions = Vec::new();
+    for e in &evals {
+        if let Ok(Some(d)) = db::latest_disposition_for_evaluation(&state.pool, &e.id).await {
+            dispositions.push(d);
+        }
+    }
     Ok(Json(json!({
         "resource": obs,
         "changes": changes,
         "evaluations": evals,
+        "triage": triage,
+        "exceptions": exceptions,
+        "dispositions": dispositions,
         "tickets": tickets,
         "coverage": coverage,
     })))
@@ -409,6 +425,17 @@ async fn inbox(
         .await
         .unwrap_or_default();
 
+    let last_visit = db::meta_get(&state.pool, "last_visit")
+        .await
+        .ok()
+        .flatten();
+    let last_visit_dt = last_visit.as_ref().and_then(|s| {
+        DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|d| d.with_timezone(&Utc))
+    });
+    let now = Utc::now();
+
     let mut rows = Vec::new();
     for ch in changes {
         if !tracked.iter().any(|t| t == ch.subscription_id.as_str()) {
@@ -438,10 +465,12 @@ async fn inbox(
                 continue;
             }
         }
-        let related_eval = evals
+        let resource_evals: Vec<_> = evals
             .iter()
-            .find(|e| e.resource_id == ch.resource_id)
-            .cloned();
+            .filter(|e| e.resource_id == ch.resource_id)
+            .cloned()
+            .collect();
+        let related_eval = resource_evals.first().cloned();
         if let Some(ref sev) = q.severity {
             if related_eval
                 .as_ref()
@@ -451,37 +480,60 @@ async fn inbox(
                 continue;
             }
         }
+        let triage = triage_with_history(&resource_evals, now);
+        let disposition = if let Some(ref ev) = related_eval {
+            db::latest_disposition_for_evaluation(&state.pool, &ev.id)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let since_last_visit = last_visit_dt
+            .map(|lv| ch.times.observation_time > lv)
+            .unwrap_or(true);
         rows.push(json!({
             "change": ch,
             "classification": class,
             "evaluation": related_eval,
+            "triage": triage,
+            "disposition": disposition,
             "resource": obs,
+            "since_last_visit": since_last_visit,
         }));
     }
 
-    // Elevate unresolved / failing
+    // Elevate actionable / awaiting / unresolved; stable tie-break by observation time desc.
     rows.sort_by(|a, b| {
-        let af = a
-            .pointer("/evaluation/outcome")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let bf = b
-            .pointer("/evaluation/outcome")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let rank = |o: &str| match o {
-            "fail" => 0,
-            "unknown" => 1,
-            _ => 2,
+        let rank = |row: &Value| {
+            let state = row
+                .pointer("/triage/state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            match state {
+                "actionable" => 0,
+                "awaiting_grace" => 1,
+                "fail" | "unknown" => 2,
+                "verified_corrected" => 3,
+                _ => 4,
+            }
         };
-        rank(af).cmp(&rank(bf))
+        let cmp = rank(a).cmp(&rank(b));
+        if cmp != std::cmp::Ordering::Equal {
+            return cmp;
+        }
+        let at = a
+            .pointer("/change/times/observation_time")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let bt = b
+            .pointer("/change/times/observation_time")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        bt.cmp(at)
     });
 
-    let last_visit = db::meta_get(&state.pool, "last_visit")
-        .await
-        .ok()
-        .flatten();
-    let _ = db::meta_set(&state.pool, "last_visit", &Utc::now().to_rfc3339()).await;
+    let _ = db::meta_set(&state.pool, "last_visit", &now.to_rfc3339()).await;
 
     Ok(Json(json!({
         "rows": rows,
@@ -510,16 +562,142 @@ async fn compliance_summary(
             EvalOutcome::Inapplicable => inapplicable += 1,
         }
     }
+    let now = Utc::now();
+    let mut actionable = 0;
+    let mut awaiting_grace = 0;
+    let mut verified = 0;
+    // Group by resource+control for triage history
+    let mut by_key: std::collections::HashMap<(String, String), Vec<Evaluation>> =
+        std::collections::HashMap::new();
+    for e in &evals {
+        by_key
+            .entry((e.resource_id.as_str().to_string(), e.control_id.clone()))
+            .or_default()
+            .push(e.clone());
+    }
+    for (_k, hist) in &by_key {
+        if let Some(info) = triage_with_history(hist, now) {
+            match info.state {
+                TriageState::Actionable => actionable += 1,
+                TriageState::AwaitingGrace => awaiting_grace += 1,
+                TriageState::VerifiedCorrected => verified += 1,
+                _ => {}
+            }
+        }
+    }
+    let exceptions = db::count_active_exceptions(&state.pool)
+        .await
+        .unwrap_or(0);
+
     Ok(Json(json!({
         "passing": pass,
         "failing": fail,
         "unknown": unknown,
         "inapplicable": inapplicable,
-        "exceptions": 0,
-        "pending_remediation": fail,
-        "freshness": Utc::now(),
+        "exceptions": exceptions,
+        "pending_remediation": actionable,
+        "awaiting_grace": awaiting_grace,
+        "verified_corrected": verified,
+        "freshness": now,
         "scope": db::tracked_subscription_ids(&state.pool).await.unwrap_or_default(),
     })))
+}
+
+#[derive(Deserialize)]
+struct ExceptionCreate {
+    resource_id: String,
+    control_id: String,
+    reason: Option<String>,
+    approved_by: Option<String>,
+    expires_at: Option<String>,
+}
+
+async fn create_exception(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ExceptionCreate>,
+) -> Result<Json<Value>, StatusCode> {
+    require_mutation(&state, &headers)?;
+    let expires_at = body
+        .expires_at
+        .as_ref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc));
+    let ex = ExceptionRecord {
+        id: Uuid::new_v4().to_string(),
+        resource_id: body.resource_id,
+        control_id: body.control_id,
+        reason: body.reason,
+        approved_by: body.approved_by,
+        expires_at,
+        created_at: Utc::now(),
+    };
+    db::insert_exception(&state.pool, &ex)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "exception": ex })))
+}
+
+#[derive(Deserialize)]
+struct ExceptionListQuery {
+    resource_id: Option<String>,
+}
+
+async fn list_exceptions_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ExceptionListQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
+    let rows = db::list_exceptions(&state.pool, q.resource_id.as_deref())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "exceptions": rows })))
+}
+
+#[derive(Deserialize)]
+struct DispositionCreate {
+    evaluation_id: String,
+    owner: Option<String>,
+    disposition: String,
+    ticket_ref: Option<String>,
+}
+
+async fn create_disposition(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DispositionCreate>,
+) -> Result<Json<Value>, StatusCode> {
+    require_mutation(&state, &headers)?;
+    let d = DispositionRecord {
+        id: Uuid::new_v4().to_string(),
+        evaluation_id: body.evaluation_id,
+        owner: body.owner,
+        disposition: body.disposition,
+        ticket_ref: body.ticket_ref,
+        created_at: Utc::now(),
+    };
+    db::insert_disposition(&state.pool, &d)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "disposition": d })))
+}
+
+#[derive(Deserialize)]
+struct DispositionListQuery {
+    evaluation_id: Option<String>,
+}
+
+async fn list_dispositions_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<DispositionListQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
+    let rows = db::list_dispositions(&state.pool, q.evaluation_id.as_deref())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "dispositions": rows })))
 }
 
 async fn list_class_rules(
@@ -1249,6 +1427,8 @@ struct ChatAskReq {
     question: String,
     include_ticket_notes: Option<bool>,
     environment: Option<String>,
+    subscription_id: Option<String>,
+    severity: Option<String>,
 }
 
 async fn chat_ask(
@@ -1276,15 +1456,29 @@ async fn chat_ask(
     let resources = db::list_latest_resources(&state.pool)
         .await
         .unwrap_or_default();
+    let evals = db::list_evaluations(&state.pool, 2000)
+        .await
+        .unwrap_or_default();
     let mut gaps = Vec::new();
     let mut records = Vec::new();
     for r in resources {
         if !tracked.iter().any(|t| t == r.subscription_id.as_str()) {
             continue;
         }
+        if let Some(ref sid) = req.subscription_id {
+            if r.subscription_id.as_str() != sid {
+                continue;
+            }
+        }
         let class = classify_resource(&r, &rules);
         if let Some(ref env) = req.environment {
             if class.environment.as_str() != env {
+                continue;
+            }
+        }
+        let related = evals.iter().find(|e| e.resource_id == r.resource_id);
+        if let Some(ref sev) = req.severity {
+            if related.map(|e| e.severity.as_str() != sev).unwrap_or(true) {
                 continue;
             }
         }
@@ -1299,6 +1493,9 @@ async fn chat_ask(
             "name": r.name,
             "subscription_id": r.subscription_id,
             "observation_time": r.observation_time,
+            "environment": class.environment,
+            "compliance": related.map(|e| e.outcome.as_str()),
+            "severity": related.map(|e| e.severity.as_str()),
             "ticket_number": tickets.first().and_then(|t| t.get("record_number").cloned()),
             "ticket_state": tickets.first().and_then(|t| t.get("lookup_status").cloned()),
         }));
@@ -1319,7 +1516,12 @@ async fn chat_ask(
 
     let ctx = ApprovedChatContext {
         question: req.question,
-        view_filters: json!({ "environment": req.environment, "tracked_only": true }),
+        view_filters: json!({
+            "environment": req.environment,
+            "subscription_id": req.subscription_id,
+            "severity": req.severity,
+            "tracked_only": true
+        }),
         records,
         evidence_time: Some(Utc::now().to_rfc3339()),
         gaps,

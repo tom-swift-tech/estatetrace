@@ -112,6 +112,11 @@ th { background: #e4e7eb; font-weight: 600; }
 .badge.pass { background: #c6f6d5; color: var(--et-pass); }
 .badge.fail { background: #fed7d7; color: var(--et-fail); }
 .badge.unknown { background: #fefcbf; color: var(--et-unknown); }
+.badge.inapplicable { background: #e2e8f0; color: var(--et-inapplicable); }
+.badge.awaiting_grace { background: #fefcbf; color: var(--et-unknown); }
+.badge.actionable { background: #fed7d7; color: var(--et-fail); }
+.badge.verified_corrected { background: #c6f6d5; color: var(--et-pass); }
+.badge.since { background: #e9d8fd; color: #553c9a; margin-top: 0.25rem; }
 .badge.prod { background: #bee3f8; color: #2a4365; }
 .badge.track { background: #c6f6d5; color: #276749; }
 .badge.exclude { background: #e2e8f0; color: #4a5568; }

@@ -99,3 +99,86 @@ pub fn restore_backup(archive: &Path, dest_profile: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use estatetrace_core::SettingsDoc;
+    use serde_json::json;
+    use std::fs;
+    use std::io::Read;
+
+    fn write_profile(profile: &Path) {
+        fs::create_dir_all(profile.join("packs")).unwrap();
+        fs::create_dir_all(profile.join("themes")).unwrap();
+        fs::write(profile.join("estatetrace.db"), b"sqlite-placeholder").unwrap();
+
+        let settings = SettingsDoc {
+            scan_interval_minutes: 30,
+            operations_timezone: Some("America/Chicago".into()),
+            chat_history_enabled: false,
+            retention: json!({}),
+            production_mappings: json!({}),
+            servicenow: Some(json!({
+                "instance_url": "https://example.service-now.com",
+                "username": "svc.estatetrace"
+            })),
+            chat: Some(json!({
+                "gateway_url": "https://apim.example/openai",
+                "deployment": "gpt",
+                "header_name": "Ocp-Apim-Subscription-Key"
+            })),
+            theme_path: Some("themes/company.yaml".into()),
+        };
+        let text = serde_json::to_string_pretty(&settings).unwrap();
+        assert!(!text.to_ascii_lowercase().contains("password"));
+        fs::write(profile.join("settings.json"), text).unwrap();
+        fs::write(
+            profile.join("themes/company.yaml"),
+            "name: Company\naccent: \"#0b6e4f\"\n",
+        )
+        .unwrap();
+        fs::write(profile.join("packs/pilot.json"), "{}").unwrap();
+    }
+
+    #[test]
+    fn ac06_backup_restore_roundtrip_preserves_settings_and_theme() {
+        let src = tempfile::tempdir().unwrap();
+        let dest_profile = tempfile::tempdir().unwrap();
+        write_profile(src.path());
+
+        let archive = src.path().join("backups/test.zip");
+        fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        create_backup(src.path(), &archive).unwrap();
+
+        let file = fs::File::open(&archive).unwrap();
+        let mut zip = ZipArchive::new(file).unwrap();
+        let mut names = Vec::new();
+        for i in 0..zip.len() {
+            let mut f = zip.by_index(i).unwrap();
+            names.push(f.name().to_string());
+            let mut buf = String::new();
+            let _ = f.read_to_string(&mut buf);
+            let lower = buf.to_ascii_lowercase();
+            assert!(
+                !lower.contains("password") && !lower.contains("\"key\":"),
+                "backup blob leaked secret-like field in {}",
+                f.name()
+            );
+        }
+        assert!(names.iter().any(|n| n == "settings.json"));
+        assert!(names.iter().any(|n| n.starts_with("themes/")));
+        assert!(names.iter().any(|n| n.starts_with("packs/")));
+
+        restore_backup(&archive, dest_profile.path()).unwrap();
+        let restored = fs::read_to_string(dest_profile.path().join("settings.json")).unwrap();
+        let doc: SettingsDoc = serde_json::from_str(&restored).unwrap();
+        assert_eq!(doc.scan_interval_minutes, 30);
+        assert_eq!(
+            doc.operations_timezone.as_deref(),
+            Some("America/Chicago")
+        );
+        assert!(dest_profile.path().join("themes/company.yaml").exists());
+        assert!(dest_profile.path().join("packs/pilot.json").exists());
+    }
+}

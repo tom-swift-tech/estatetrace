@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
     }) {
         Commands::Serve { bind, open } => {
             let state = AppState::bootstrap().await?;
+            spawn_periodic_scan(state.clone());
             let app = api::router(state.clone());
             let addr: SocketAddr = bind.parse()?;
             tracing::info!("EstateTrace listening on http://{addr}");
@@ -97,12 +98,34 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn spawn_periodic_scan(state: state::AppState) {
+    tokio::spawn(async move {
+        loop {
+            let minutes = state.settings.read().await.scan_interval_minutes.max(1);
+            let dur = std::time::Duration::from_secs(minutes * 60);
+            tokio::time::sleep(dur).await;
+            tracing::info!("periodic scan starting (interval {minutes}m)");
+            if let Err(e) = scan::run_scan(&state).await {
+                tracing::error!("periodic scan error: {e}");
+            }
+        }
+    });
+}
+
 /// Minimal opener without extra crate dependency issues on Windows.
 mod open {
     pub fn that(url: &str) -> std::io::Result<()> {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn()
-            .map(|_| ())
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "start", "", url])
+                .spawn()
+                .map(|_| ())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = url;
+            Ok(())
+        }
     }
 }

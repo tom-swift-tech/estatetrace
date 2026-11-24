@@ -409,109 +409,129 @@ impl ServiceNowClient {
             data.get("result").unwrap_or(&Value::Null),
             "change",
         ));
+        let _ = now;
+        Ok(classify_changes_before_incident(
+            incident,
+            &tickets,
+            anchor,
+            anchor_source,
+            lookback_hours,
+            self.config
+                .operations_timezone
+                .clone()
+                .unwrap_or_else(local_tz_name),
+        ))
+    }
+}
 
-        let mut completed: Vec<IncidentChangeMatch> = Vec::new();
-        let mut overlapping: Vec<IncidentChangeMatch> = Vec::new();
-        let mut seen = HashSet::new();
+/// Pure INT-04 matcher for fixture tests (AC-10).
+pub fn classify_changes_before_incident(
+    incident: &SnTicket,
+    tickets: &[SnTicket],
+    anchor: DateTime<Utc>,
+    anchor_source: Option<&str>,
+    lookback_hours: i64,
+    timezone: String,
+) -> Value {
+    let lookback_start = anchor - Duration::hours(lookback_hours);
+    let mut completed: Vec<IncidentChangeMatch> = Vec::new();
+    let mut overlapping: Vec<IncidentChangeMatch> = Vec::new();
+    let mut seen = HashSet::new();
 
-        for chg in tickets {
-            // Omit planned-only
-            if chg.actual_end.is_none() && chg.actual_start.is_none() {
-                continue;
-            }
+    for chg in tickets {
+        if chg.actual_end.is_none() && chg.actual_start.is_none() {
+            continue;
+        }
 
-            let mut reasons = Vec::new();
-            if same_resource(incident, &chg) {
-                reasons.push("same_resource".into());
-            }
-            if same_service(incident, &chg) {
-                reasons.push("same_service".into());
-            }
-            if reasons.is_empty() {
-                continue;
-            }
+        let mut reasons = Vec::new();
+        if same_resource(incident, chg) {
+            reasons.push("same_resource".into());
+        }
+        if same_service(incident, chg) {
+            reasons.push("same_service".into());
+        }
+        if reasons.is_empty() {
+            continue;
+        }
 
-            let make_match = |kind: &str, reasons: &[String]| IncidentChangeMatch {
-                elapsed_to_incident: chg
-                    .actual_end
-                    .map(|e| format!("{}s", (anchor - e).num_seconds())),
-                change: chg.clone(),
-                reasons: reasons.to_vec(),
-                match_kind: kind.into(),
-            };
+        let make_match = |kind: &str, reasons: &[String]| IncidentChangeMatch {
+            elapsed_to_incident: chg
+                .actual_end
+                .map(|e| format!("{}s", (anchor - e).num_seconds())),
+            change: chg.clone(),
+            reasons: reasons.to_vec(),
+            match_kind: kind.into(),
+        };
 
-            if let Some(end) = chg.actual_end {
-                if end >= lookback_start && end < anchor {
-                    if seen.insert(chg.sys_id.clone()) {
-                        completed.push(make_match("completed", &reasons));
-                    } else if let Some(existing) =
-                        completed.iter_mut().find(|m| m.change.sys_id == chg.sys_id)
-                    {
-                        for r in &reasons {
-                            if !existing.reasons.contains(r) {
-                                existing.reasons.push(r.clone());
-                            }
+        if let Some(end) = chg.actual_end {
+            if end >= lookback_start && end < anchor {
+                if seen.insert(chg.sys_id.clone()) {
+                    completed.push(make_match("completed", &reasons));
+                } else if let Some(existing) =
+                    completed.iter_mut().find(|m| m.change.sys_id == chg.sys_id)
+                {
+                    for r in &reasons {
+                        if !existing.reasons.contains(r) {
+                            existing.reasons.push(r.clone());
                         }
                     }
                 }
             }
-
-            // Spec: missing end alone does not establish overlap.
-            let overlap = match (chg.actual_start, chg.actual_end) {
-                (Some(start), Some(end)) => start < anchor && end >= anchor,
-                (Some(start), None) => {
-                    start < anchor
-                        && chg
-                            .implementation_outcome
-                            .as_deref()
-                            .map(|s| s.to_ascii_lowercase().contains("progress"))
-                            .unwrap_or(false)
-                }
-                _ => false,
-            };
-            let _ = now;
-            if overlap {
-                let in_completed = completed.iter().position(|m| m.change.sys_id == chg.sys_id);
-                let in_overlapping = overlapping.iter().any(|m| m.change.sys_id == chg.sys_id);
-                if let Some(idx) = in_completed {
-                    if !completed[idx].reasons.iter().any(|r| r == "overlap") {
-                        completed[idx].reasons.push("overlap".into());
-                    }
-                    if !in_overlapping {
-                        let mut m = completed[idx].clone();
-                        m.match_kind = "implementing_at_start".into();
-                        overlapping.push(m);
-                    }
-                } else if let Some(idx) = overlapping
-                    .iter()
-                    .position(|m| m.change.sys_id == chg.sys_id)
-                {
-                    if !overlapping[idx].reasons.iter().any(|r| r == "overlap") {
-                        overlapping[idx].reasons.push("overlap".into());
-                    }
-                } else {
-                    overlapping.push(make_match("implementing_at_start", &reasons));
-                }
-            }
         }
 
-        completed.sort_by(|a, b| b.change.actual_end.cmp(&a.change.actual_end));
-
-        Ok(json!({
-            "anchor": anchor,
-            "anchor_source": anchor_source,
-            "timezone": self.config.operations_timezone.clone().unwrap_or_else(local_tz_name),
-            "lookback_hours": lookback_hours,
-            "completed": completed,
-            "implementing_at_start": overlapping,
-            "coverage": "complete",
-            "message": if completed.is_empty() && overlapping.is_empty() {
-                "No matching changes"
-            } else {
-                ""
+        let overlap = match (chg.actual_start, chg.actual_end) {
+            (Some(start), Some(end)) => start < anchor && end >= anchor,
+            (Some(start), None) => {
+                start < anchor
+                    && chg
+                        .implementation_outcome
+                        .as_deref()
+                        .map(|s| s.to_ascii_lowercase().contains("progress"))
+                        .unwrap_or(false)
             }
-        }))
+            _ => false,
+        };
+        if overlap {
+            let in_completed = completed.iter().position(|m| m.change.sys_id == chg.sys_id);
+            let in_overlapping = overlapping.iter().any(|m| m.change.sys_id == chg.sys_id);
+            if let Some(idx) = in_completed {
+                if !completed[idx].reasons.iter().any(|r| r == "overlap") {
+                    completed[idx].reasons.push("overlap".into());
+                }
+                if !in_overlapping {
+                    let mut m = completed[idx].clone();
+                    m.match_kind = "implementing_at_start".into();
+                    overlapping.push(m);
+                }
+            } else if let Some(idx) = overlapping
+                .iter()
+                .position(|m| m.change.sys_id == chg.sys_id)
+            {
+                if !overlapping[idx].reasons.iter().any(|r| r == "overlap") {
+                    overlapping[idx].reasons.push("overlap".into());
+                }
+            } else {
+                overlapping.push(make_match("implementing_at_start", &reasons));
+            }
+        }
     }
+
+    completed.sort_by(|a, b| b.change.actual_end.cmp(&a.change.actual_end));
+
+    json!({
+        "anchor": anchor,
+        "anchor_source": anchor_source,
+        "timezone": timezone,
+        "lookback_hours": lookback_hours,
+        "completed": completed,
+        "implementing_at_start": overlapping,
+        "coverage": "complete",
+        "message": if completed.is_empty() && overlapping.is_empty() {
+            "No matching changes"
+        } else {
+            ""
+        }
+    })
 }
 
 fn same_resource(inc: &SnTicket, chg: &SnTicket) -> bool {
@@ -756,5 +776,194 @@ mod tests {
             refresh,
             "America/Chicago"
         ));
+    }
+
+    fn ticket(
+        sys_id: &str,
+        number: &str,
+        ci: Option<&str>,
+        service: Option<&str>,
+        actual_start: Option<DateTime<Utc>>,
+        actual_end: Option<DateTime<Utc>>,
+    ) -> SnTicket {
+        SnTicket {
+            sys_id: sys_id.into(),
+            number: number.into(),
+            short_description: number.into(),
+            state: "closed".into(),
+            priority: None,
+            assignment_group: None,
+            service: service.map(|s| s.into()),
+            configuration_item: ci.map(|s| s.into()),
+            planned_start: None,
+            planned_end: None,
+            actual_start,
+            actual_end,
+            opened_at: None,
+            impact_start: None,
+            link: format!("https://example.service-now.com/{number}"),
+            implementation_outcome: None,
+        }
+    }
+
+    #[test]
+    fn ac10_same_resource_same_service_overlap_and_dedupe() {
+        let impact = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+        let incident = SnTicket {
+            sys_id: "inc1".into(),
+            number: "INC001".into(),
+            short_description: "outage".into(),
+            state: "2".into(),
+            priority: Some("1".into()),
+            assignment_group: None,
+            service: Some("Payments".into()),
+            configuration_item: Some("ci-app".into()),
+            planned_start: None,
+            planned_end: None,
+            actual_start: None,
+            actual_end: None,
+            opened_at: Some(impact + Duration::hours(2)),
+            impact_start: Some(impact),
+            link: "https://example.service-now.com/INC001".into(),
+            implementation_outcome: None,
+        };
+
+        let same_ci = ticket(
+            "chg-ci",
+            "CHG001",
+            Some("ci-app"),
+            Some("Other"),
+            Some(impact - Duration::hours(50)),
+            Some(impact - Duration::hours(48)),
+        );
+        let same_svc = ticket(
+            "chg-svc",
+            "CHG002",
+            Some("ci-other"),
+            Some("Payments"),
+            Some(impact - Duration::minutes(40)),
+            Some(impact - Duration::minutes(20)),
+        );
+        let both = ticket(
+            "chg-both",
+            "CHG003",
+            Some("ci-app"),
+            Some("Payments"),
+            Some(impact - Duration::hours(3)),
+            Some(impact - Duration::hours(1)),
+        );
+        let overlapping = ticket(
+            "chg-overlap",
+            "CHG004",
+            Some("ci-app"),
+            None,
+            Some(impact - Duration::hours(1)),
+            Some(impact + Duration::minutes(30)),
+        );
+        let planned_only = SnTicket {
+            planned_start: Some(impact - Duration::hours(2)),
+            planned_end: Some(impact - Duration::hours(1)),
+            ..ticket("chg-plan", "CHG005", Some("ci-app"), None, None, None)
+        };
+        let unrelated = ticket(
+            "chg-x",
+            "CHG006",
+            Some("ci-x"),
+            Some("Billing"),
+            Some(impact - Duration::hours(2)),
+            Some(impact - Duration::hours(1)),
+        );
+
+        let result = classify_changes_before_incident(
+            &incident,
+            &[
+                same_ci,
+                same_svc,
+                both,
+                overlapping,
+                planned_only,
+                unrelated,
+            ],
+            impact,
+            Some("impact_start"),
+            48,
+            "UTC".into(),
+        );
+
+        let completed = result["completed"].as_array().unwrap();
+        let implementing = result["implementing_at_start"].as_array().unwrap();
+
+        assert!(completed.iter().any(|m| {
+            m["change"]["number"] == "CHG001"
+                && m["reasons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r == "same_resource")
+        }));
+        assert!(completed.iter().any(|m| {
+            m["change"]["number"] == "CHG002"
+                && m["reasons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r == "same_service")
+        }));
+        let both_row = completed
+            .iter()
+            .find(|m| m["change"]["number"] == "CHG003")
+            .expect("both reasons");
+        let reasons = both_row["reasons"].as_array().unwrap();
+        assert!(reasons.iter().any(|r| r == "same_resource"));
+        assert!(reasons.iter().any(|r| r == "same_service"));
+        // Nearest completed first (CHG002 at -20m, then CHG003 at -1h, then CHG001 at -48h)
+        assert_eq!(completed[0]["change"]["number"], "CHG002");
+        assert_eq!(completed[1]["change"]["number"], "CHG003");
+
+        assert!(implementing.iter().any(|m| m["change"]["number"] == "CHG004"));
+        assert!(!completed.iter().any(|m| m["change"]["number"] == "CHG005"));
+        assert!(!completed.iter().any(|m| m["change"]["number"] == "CHG006"));
+        assert_eq!(result["anchor_source"], "impact_start");
+    }
+
+    #[test]
+    fn ac10_opened_at_fallback_when_impact_missing() {
+        let opened = Utc.with_ymd_and_hms(2026, 6, 1, 14, 0, 0).unwrap();
+        let incident = SnTicket {
+            sys_id: "inc2".into(),
+            number: "INC002".into(),
+            short_description: "outage".into(),
+            state: "2".into(),
+            priority: Some("1".into()),
+            assignment_group: None,
+            service: None,
+            configuration_item: Some("ci-app".into()),
+            planned_start: None,
+            planned_end: None,
+            actual_start: None,
+            actual_end: None,
+            opened_at: Some(opened),
+            impact_start: None,
+            link: "https://example.service-now.com/INC002".into(),
+            implementation_outcome: None,
+        };
+        let chg = ticket(
+            "chg1",
+            "CHG010",
+            Some("ci-app"),
+            None,
+            Some(opened - Duration::hours(2)),
+            Some(opened - Duration::hours(1)),
+        );
+        let result = classify_changes_before_incident(
+            &incident,
+            &[chg],
+            opened,
+            Some("opened_at_fallback"),
+            48,
+            "UTC".into(),
+        );
+        assert_eq!(result["anchor_source"], "opened_at_fallback");
+        assert_eq!(result["completed"].as_array().unwrap().len(), 1);
     }
 }
