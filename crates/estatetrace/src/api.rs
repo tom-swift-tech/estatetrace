@@ -99,8 +99,29 @@ fn require_session(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCo
     }
 }
 
+/// Strict Origin check for CORS and mutations (issue #3).
+/// Parses as a URL; requires http/https, no userinfo, and an exact loopback host.
 fn is_loopback_origin(origin: &str) -> bool {
-    origin.starts_with("http://127.0.0.1") || origin.starts_with("http://localhost")
+    if origin.eq_ignore_ascii_case("null") {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(origin) else {
+        return false;
+    };
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return false,
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        // [::1] is loopback; allowed when dual-stack clients send it.
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
 }
 
 fn origin_ok(headers: &HeaderMap) -> bool {
@@ -1770,9 +1791,29 @@ mod auth_tests {
         assert!(origin_ok(&headers));
         headers.insert("origin", "http://localhost:5173".parse().unwrap());
         assert!(origin_ok(&headers));
+        headers.insert("origin", "https://127.0.0.1".parse().unwrap());
+        assert!(origin_ok(&headers));
+        headers.insert("origin", "http://[::1]:8787".parse().unwrap());
+        assert!(origin_ok(&headers));
         headers.insert("origin", "https://evil.example".parse().unwrap());
         assert!(!origin_ok(&headers));
         headers.insert("origin", "null".parse().unwrap());
         assert!(!origin_ok(&headers));
+    }
+
+    #[test]
+    fn origin_helper_rejects_lookalikes_and_userinfo() {
+        assert!(!is_loopback_origin("http://127.0.0.1.evil.example"));
+        assert!(!is_loopback_origin("http://localhost.evil.example"));
+        assert!(!is_loopback_origin("http://127.0.0.1@evil.example"));
+        assert!(!is_loopback_origin("http://localhost@evil.example"));
+        assert!(!is_loopback_origin("null"));
+        assert!(!is_loopback_origin("not-a-url"));
+        assert!(!is_loopback_origin("ftp://127.0.0.1"));
+        assert!(!is_loopback_origin("http://192.168.1.1"));
+        assert!(!is_loopback_origin("http://0.0.0.0"));
+        assert!(is_loopback_origin("http://127.0.0.1:8787"));
+        assert!(is_loopback_origin("http://localhost"));
+        assert!(is_loopback_origin("http://[::1]"));
     }
 }
