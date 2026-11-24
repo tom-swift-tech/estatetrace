@@ -1,5 +1,8 @@
+## Status
+Remediated in PR #2 / issue #3: `is_loopback_origin` now parses Origins as URLs and requires an exact loopback host (`localhost`, IPv4/IPv6 loopback), http(s) scheme, and no userinfo.
+
 ## Summary
-A security review identified authentication and origin-validation gaps in API handlers. The sensitive API protections were remediated by commit `8ea2374`, but the loopback Origin check still uses unsafe prefix matching.
+A security review identified authentication and origin-validation gaps in API handlers. The sensitive API protections were remediated by commit `8ea2374`, but the loopback Origin check still used unsafe prefix matching (fixed).
 
 ## Severity
 Medium for the residual finding; the earlier High findings are considered remediated.

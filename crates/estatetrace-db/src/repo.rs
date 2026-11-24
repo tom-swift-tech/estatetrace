@@ -1337,3 +1337,131 @@ pub async fn save_incident_lookup(
     .await?;
     Ok(id)
 }
+
+pub async fn insert_exception(pool: &SqlitePool, ex: &ExceptionRecord) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO exceptions(id, resource_id, control_id, reason, approved_by, expires_at, created_at)
+         VALUES(?,?,?,?,?,?,?)",
+    )
+    .bind(&ex.id)
+    .bind(&ex.resource_id)
+    .bind(&ex.control_id)
+    .bind(&ex.reason)
+    .bind(&ex.approved_by)
+    .bind(ex.expires_at.map(|d| d.to_rfc3339()))
+    .bind(ex.created_at.to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_exceptions(
+    pool: &SqlitePool,
+    resource_id: Option<&str>,
+) -> Result<Vec<ExceptionRecord>> {
+    let rows = if let Some(rid) = resource_id {
+        sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>, Option<String>, String)>(
+            "SELECT id, resource_id, control_id, reason, approved_by, expires_at, created_at
+             FROM exceptions WHERE resource_id = ? ORDER BY created_at DESC",
+        )
+        .bind(rid)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>, Option<String>, String)>(
+            "SELECT id, resource_id, control_id, reason, approved_by, expires_at, created_at
+             FROM exceptions ORDER BY created_at DESC LIMIT 500",
+        )
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows
+        .into_iter()
+        .map(|(id, rid, cid, reason, approved, exp, created)| ExceptionRecord {
+            id,
+            resource_id: rid,
+            control_id: cid,
+            reason,
+            approved_by: approved,
+            expires_at: exp.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|d| d.with_timezone(&Utc))
+            }),
+            created_at: DateTime::parse_from_rfc3339(&created)
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        })
+        .collect())
+}
+
+pub async fn count_active_exceptions(pool: &SqlitePool) -> Result<i64> {
+    let now = Utc::now().to_rfc3339();
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM exceptions
+         WHERE expires_at IS NULL OR expires_at > ?",
+    )
+    .bind(now)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+pub async fn insert_disposition(pool: &SqlitePool, d: &DispositionRecord) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO dispositions(id, evaluation_id, owner, disposition, ticket_ref, created_at)
+         VALUES(?,?,?,?,?,?)",
+    )
+    .bind(&d.id)
+    .bind(&d.evaluation_id)
+    .bind(&d.owner)
+    .bind(&d.disposition)
+    .bind(&d.ticket_ref)
+    .bind(d.created_at.to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_dispositions(
+    pool: &SqlitePool,
+    evaluation_id: Option<&str>,
+) -> Result<Vec<DispositionRecord>> {
+    let rows = if let Some(eid) = evaluation_id {
+        sqlx::query_as::<_, (String, String, Option<String>, String, Option<String>, String)>(
+            "SELECT id, evaluation_id, owner, disposition, ticket_ref, created_at
+             FROM dispositions WHERE evaluation_id = ? ORDER BY created_at DESC",
+        )
+        .bind(eid)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, (String, String, Option<String>, String, Option<String>, String)>(
+            "SELECT id, evaluation_id, owner, disposition, ticket_ref, created_at
+             FROM dispositions ORDER BY created_at DESC LIMIT 500",
+        )
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows
+        .into_iter()
+        .map(|(id, eid, owner, disposition, ticket, created)| DispositionRecord {
+            id,
+            evaluation_id: eid,
+            owner,
+            disposition,
+            ticket_ref: ticket,
+            created_at: DateTime::parse_from_rfc3339(&created)
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        })
+        .collect())
+}
+
+pub async fn latest_disposition_for_evaluation(
+    pool: &SqlitePool,
+    evaluation_id: &str,
+) -> Result<Option<DispositionRecord>> {
+    let rows = list_dispositions(pool, Some(evaluation_id)).await?;
+    Ok(rows.into_iter().next())
+}
