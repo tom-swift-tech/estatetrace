@@ -111,6 +111,26 @@ export interface ComplianceSummary {
   verified_corrected?: number;
   freshness?: string;
   scope?: string[];
+  coverage_gaps?: CoverageGap[];
+  controls_evaluated?: number;
+  controls_total?: number;
+}
+
+export type GapCategory =
+  | "outside_azure"
+  | "more_collection"
+  | "by_construction"
+  | "needs_decision"
+  | "deep_collection";
+
+/** A control (or deep-only target type) that the scan cannot judge per resource. */
+export interface CoverageGap {
+  pack_id: string;
+  control_id: string;
+  category: GapCategory;
+  note: string;
+  resource_type: string | null;
+  resource_count: number;
 }
 
 export interface PropertyDiff {
