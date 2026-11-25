@@ -46,6 +46,10 @@ pub fn router(state: AppState) -> Router {
         .route("/inbox", get(inbox))
         .route("/findings", get(list_findings_api))
         .route("/compliance", get(compliance_summary))
+        .route("/compliance/queue", get(compliance_queue_api))
+        .route("/compliance/aging", get(compliance_aging_api))
+        .route("/compliance/flow", get(compliance_flow_api))
+        .route("/compliance/trend", get(compliance_trend_api))
         .route("/exceptions", get(list_exceptions_api).post(create_exception))
         .route("/dispositions", get(list_dispositions_api).post(create_disposition))
         .route("/classification/rules", get(list_class_rules).post(save_class_rule))
@@ -548,14 +552,19 @@ struct InboxQuery {
     owner: Option<String>,
     /// P4: `owner` | `application` | `subscription`.
     group_by: Option<String>,
+    /// P6 (AC-P6-1): findings lane, `security` (default) | `hygiene` | `all`. Hygiene
+    /// findings never rank a row unless asked for.
+    lane: Option<String>,
 }
 
 async fn inbox(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<InboxQuery>,
+    Query(mut q): Query<InboxQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     require_session(&state, &headers)?;
+    let lane = lane_filter(q.lane.as_deref())?;
+    q.lane = Some(lane.unwrap_or("all").to_string());
     let tracked = db::tracked_subscription_ids(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -587,6 +596,7 @@ async fn inbox(
         &FindingQuery {
             subscriptions: Some(tracked.clone()),
             resource_ids: Some(resource_ids),
+            lane: lane.map(str::to_string),
             ..Default::default()
         },
     )
@@ -826,6 +836,355 @@ async fn compliance_summary(
         "controls_evaluated": controls_evaluated,
         "controls_total": controls_total,
     })))
+}
+
+// ---- P6: reporting (spec §3.4, §4.7) ----------------------------------------------------
+// Every reporting read is limited to tracked subscriptions (invariant 13). Lane defaults to
+// `security` (security-first, azcompliance backlog #4); `lane=all` includes hygiene.
+
+#[derive(Deserialize, Default)]
+struct ReportQuery {
+    /// `security` (default) | `hygiene` | `all`.
+    lane: Option<String>,
+    /// Queue only: `application` | `owner` | `subscription` | `line_of_business`.
+    group_by: Option<String>,
+    /// Flow only: window in days, default 90.
+    days: Option<u32>,
+}
+
+/// Lane filter for a reporting or inbox query: `None` means both lanes. 400 when unknown.
+fn lane_filter(lane: Option<&str>) -> Result<Option<&'static str>, StatusCode> {
+    match lane.map(str::trim).filter(|s| !s.is_empty()) {
+        None | Some("security") => Ok(Some("security")),
+        Some("hygiene") => Ok(Some("hygiene")),
+        Some("all") => Ok(None),
+        Some(_) => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn report_scope(state: &AppState, lane: Option<&str>) -> Result<db::ReportScope, StatusCode> {
+    let tracked = db::tracked_subscription_ids(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(db::ReportScope::new(tracked, lane))
+}
+
+async fn last_visit_at(state: &AppState) -> Option<DateTime<Utc>> {
+    db::meta_get(&state.pool, "last_visit")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|d| d.with_timezone(&Utc))
+}
+
+/// Queue group for one open fail from its resource's derived ownership (AC-P4-6 rules).
+fn ownership_group_key(group_by: db::QueueGroupBy, o: &Ownership) -> String {
+    let v = match group_by {
+        db::QueueGroupBy::Application => o.application.clone().or_else(|| o.application_id.clone()),
+        db::QueueGroupBy::Owner => o.owner.clone(),
+        db::QueueGroupBy::LineOfBusiness => o
+            .line_of_business_name
+            .clone()
+            .or_else(|| o.line_of_business.clone()),
+        db::QueueGroupBy::Subscription => None,
+    };
+    v.unwrap_or_default()
+}
+
+/// Derived ownership of each distinct resource in `rows`, computed once per resource.
+fn ownership_by_resource(
+    ctx: &ClassCtx,
+    rows: &[db::OpenFailResource],
+) -> std::collections::HashMap<String, Ownership> {
+    let mut out = std::collections::HashMap::new();
+    for r in rows {
+        if out.contains_key(&r.resource_id) {
+            continue;
+        }
+        let o = r
+            .observation
+            .as_ref()
+            .map(|obs| ctx.ownership(obs))
+            .unwrap_or_default();
+        out.insert(r.resource_id.clone(), o);
+    }
+    out
+}
+
+/// `GET /api/compliance/queue?lane=&group_by=`: open fails by control, lane, environment and
+/// group, with `new_since_last_visit` against `meta.last_visit` (read, not updated here).
+/// Ownership groups derive ownership in Rust over one batched read of intervals + latest
+/// observations; subscription grouping is done in SQL.
+async fn compliance_queue_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
+    let lane = lane_filter(q.lane.as_deref())?;
+    let group_by = match q.group_by.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(g) => Some(db::QueueGroupBy::parse(g).ok_or(StatusCode::BAD_REQUEST)?),
+    };
+    let scope = report_scope(&state, lane).await?;
+    let last_visit = last_visit_at(&state).await;
+    let rows = match group_by {
+        None | Some(db::QueueGroupBy::Subscription) => {
+            let by_sub = group_by.is_some();
+            let mut rows = db::compliance_queue(&state.pool, &scope, by_sub, last_visit)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if by_sub {
+                let ctx = ClassCtx::load(&state).await;
+                for r in &mut rows {
+                    if let Some(name) = ctx.sub_names.get(&r.group_key) {
+                        r.group_key = name.clone();
+                    }
+                }
+            }
+            rows
+        }
+        Some(g) => {
+            let ctx = ClassCtx::load(&state).await;
+            let open = db::open_fail_resources(&state.pool, &scope)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let owners = ownership_by_resource(&ctx, &open);
+            db::aggregate_queue(&open, last_visit, |r| {
+                owners
+                    .get(&r.resource_id)
+                    .map(|o| ownership_group_key(g, o))
+                    .unwrap_or_default()
+            })
+        }
+    };
+    Ok(Json(json!({
+        "rows": rows,
+        "lane": lane.unwrap_or("all"),
+        "group_by": group_by,
+        "last_visit": last_visit,
+    })))
+}
+
+/// `GET /api/compliance/aging?lane=`: open fails per control by age bucket
+/// (`0-7`, `8-30`, `31-90`, `90+` whole days since `opened_at`).
+async fn compliance_aging_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
+    let scope = report_scope(&state, lane_filter(q.lane.as_deref())?).await?;
+    let rows = db::compliance_aging(&state.pool, &scope, Utc::now())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "rows": rows, "buckets": db::AGING_BUCKETS })))
+}
+
+/// `GET /api/compliance/flow?days=90&lane=`: fail intervals opened and closed per UTC day.
+async fn compliance_flow_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
+    let scope = report_scope(&state, lane_filter(q.lane.as_deref())?).await?;
+    let days = q.days.unwrap_or(90).clamp(1, 3650);
+    let rows = db::compliance_flow(&state.pool, &scope, days, Utc::now())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "rows": rows, "days": days })))
+}
+
+/// `GET /api/compliance/trend?lane=`: open fails per control at each of the last 26 finished
+/// scans. `scans` lists every trend point, including scans with no open fails.
+async fn compliance_trend_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
+    let scope = report_scope(&state, lane_filter(q.lane.as_deref())?).await?;
+    let rows = db::compliance_trend(&state.pool, &scope, db::TREND_SCANS)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let scans = db::trend_scans(&state.pool, db::TREND_SCANS)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "rows": rows, "scans": scans })))
+}
+
+/// Open fail counts split by lane, for the readout.
+#[derive(Default)]
+struct LaneCounts {
+    security: u64,
+    hygiene: u64,
+}
+
+impl LaneCounts {
+    fn add(&mut self, lane: estatetrace_policy::Lane, n: u64) {
+        match lane {
+            estatetrace_policy::Lane::Security => self.security += n,
+            estatetrace_policy::Lane::Hygiene => self.hygiene += n,
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "open": self.security + self.hygiene,
+            "security": self.security,
+            "hygiene": self.hygiene,
+        })
+    }
+
+    /// `[{<key>: k, open, security, hygiene}]`, largest first.
+    fn rows(map: std::collections::BTreeMap<String, LaneCounts>, key: &str) -> Vec<Value> {
+        let mut rows: Vec<Value> = map
+            .into_iter()
+            .map(|(k, c)| {
+                let mut v = c.json();
+                v[key] = json!(k);
+                v
+            })
+            .collect();
+        rows.sort_by(|a, b| b["open"].as_u64().cmp(&a["open"].as_u64()));
+        rows
+    }
+}
+
+/// Replace any string that looks like an ARM resource ID with a marker (AC-P6-5). The readout
+/// is built from aggregates only; this guards free-text values such as tag-derived LOB names.
+fn redact_resource_ids(v: &mut Value) {
+    match v {
+        Value::String(s) if s.to_ascii_lowercase().contains("/subscriptions/") => {
+            *s = "[redacted]".into();
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_resource_ids),
+        Value::Object(map) => map.values_mut().for_each(redact_resource_ids),
+        _ => {}
+    }
+}
+
+/// Leadership readout (`POST /api/evidence/export {format: "readout"}`, spec §3.4, AC-P6-5):
+/// aggregates only, with no resource or subscription IDs. Open fail counts by control,
+/// environment, line of business (name, else code) and lane; trend over the last 26 finished
+/// scans; coverage-gap categories of active packs; active exceptions in scope; scope size; and
+/// freshness. An empty scope gives zero counts and `scope_empty: true` (spec §7).
+async fn readout_payload(state: &AppState) -> anyhow::Result<Value> {
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+    let tracked = db::tracked_subscription_ids(&state.pool).await?;
+    let scope_empty = tracked.is_empty();
+    let scope = db::ReportScope::new(tracked.clone(), None);
+    let open = db::open_fail_resources(&state.pool, &scope).await?;
+    let ctx = ClassCtx::load(state).await;
+    let owners = ownership_by_resource(&ctx, &open);
+
+    // Keyed by (control, lane as serialized); `Lane` has no `Ord`.
+    let mut by_control: BTreeMap<(String, String), u64> = BTreeMap::new();
+    let mut by_env: BTreeMap<String, LaneCounts> = BTreeMap::new();
+    let mut by_lob: BTreeMap<String, LaneCounts> = BTreeMap::new();
+    let mut by_lane = LaneCounts::default();
+    for r in &open {
+        let lane_name = json!(r.lane).as_str().unwrap_or("security").to_string();
+        *by_control.entry((r.control_id.clone(), lane_name)).or_default() += 1;
+        by_env.entry(r.environment.clone()).or_default().add(r.lane, 1);
+        let lob = owners
+            .get(&r.resource_id)
+            .and_then(|o| o.line_of_business_name.clone().or_else(|| o.line_of_business.clone()))
+            .unwrap_or_else(|| "Unassigned".into());
+        by_lob.entry(lob).or_default().add(r.lane, 1);
+        by_lane.add(r.lane, 1);
+    }
+    let mut by_control: Vec<Value> = by_control
+        .into_iter()
+        .map(|((control_id, lane), open)| json!({ "control_id": control_id, "lane": lane, "open": open }))
+        .collect();
+    by_control.sort_by(|a, b| b["open"].as_u64().cmp(&a["open"].as_u64()));
+
+    // Trend: open fails per lane at each finished scan (every scan is a point).
+    let (trend_rows, scans) = if scope_empty {
+        (Vec::new(), Vec::new())
+    } else {
+        (
+            db::compliance_trend(&state.pool, &scope, db::TREND_SCANS).await?,
+            db::trend_scans(&state.pool, db::TREND_SCANS).await?,
+        )
+    };
+    let trend: Vec<Value> = scans
+        .iter()
+        .map(|s| {
+            let mut c = LaneCounts::default();
+            for r in trend_rows.iter().filter(|r| r.scan_id == s.scan_id) {
+                c.add(r.lane, r.open);
+            }
+            let mut v = c.json();
+            v["scan_started_at"] = json!(s.started_at);
+            v
+        })
+        .collect();
+
+    // Coverage-gap categories of active packs (gaps are stored per pack, not per subscription).
+    let mut gap_categories: Vec<Value> = Vec::new();
+    if !scope_empty {
+        let active: HashSet<String> = db::active_policy_packs(&state.pool)
+            .await?
+            .iter()
+            .filter_map(|p| p.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        let mut cats: BTreeMap<String, (BTreeSet<String>, u64)> = BTreeMap::new();
+        for g in db::list_coverage_gaps(&state.pool, None).await? {
+            if !active.contains(&g.pack_id) {
+                continue;
+            }
+            let category = serde_json::to_value(&g.category)?
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let e = cats.entry(category).or_default();
+            e.0.insert(format!("{}|{}", g.pack_id, g.control_id));
+            e.1 += g.resource_count;
+        }
+        gap_categories = cats
+            .into_iter()
+            .map(|(category, (controls, resources))| {
+                json!({ "category": category, "controls": controls.len(), "resources": resources })
+            })
+            .collect();
+    }
+
+    // Active exceptions whose scope lies in a tracked subscription.
+    let now = Utc::now();
+    let exceptions = db::list_exceptions(&state.pool, None, None)
+        .await?
+        .iter()
+        .filter(|x| x.is_active(now))
+        .filter(|x| {
+            let sub = x
+                .subscription_id
+                .as_deref()
+                .or_else(|| x.resource_id.as_deref().and_then(|r| arm_scope(r).0));
+            sub.is_some_and(|s| in_scope(&tracked, s))
+        })
+        .count();
+    let last_scan_at = db::last_finished_scan_started_at(&state.pool).await?;
+
+    let mut payload = json!({
+        "format": "readout",
+        "scope_empty": scope_empty,
+        "scope_size": tracked.len(),
+        "open_findings": open.len(),
+        "by_lane": by_lane.json(),
+        "by_control": by_control,
+        "by_environment": LaneCounts::rows(by_env, "environment"),
+        "by_line_of_business": LaneCounts::rows(by_lob, "line_of_business"),
+        "trend": trend,
+        "coverage_gap_categories": gap_categories,
+        "exceptions": exceptions,
+        "freshness": { "last_scan_at": last_scan_at, "generated_at": now },
+    });
+    redact_resource_ids(&mut payload);
+    Ok(payload)
 }
 
 /// Scoped exception request (spec §3.4, §4.5). Scope is `resource_id`, or `subscription_id`,
@@ -2209,6 +2568,18 @@ async fn evidence_export(
     Json(body): Json<Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
     require_mutation(&state, &headers)?;
+    // P6.3: leadership readout, aggregates only (no resource IDs).
+    if body.get("format").and_then(|v| v.as_str()) == Some("readout") {
+        let payload = readout_payload(&state)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let bytes = Bytes::from(serde_json::to_vec_pretty(&payload).unwrap_or_default());
+        return Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            bytes,
+        ));
+    }
     let resource_id = body
         .get("resource_id")
         .and_then(|v| v.as_str())
@@ -3548,5 +3919,557 @@ mod findings_api_tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(app.clone().oneshot(bad).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+}
+
+/// Phase 6 API tests: reporting endpoints, readout export and the security-first defaults.
+#[cfg(test)]
+mod reporting_api_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use chrono::Duration;
+    use estatetrace_policy::PackEvaluation;
+    use http_body_util::BodyExt;
+    use std::collections::HashSet;
+    use tower::ServiceExt;
+
+    const TRACKED: &str = "sub-tracked";
+    const UNTRACKED: &str = "sub-untracked";
+
+    fn rid(sub: &str, name: &str) -> String {
+        format!("/subscriptions/{sub}/resourceGroups/rg-app/providers/Microsoft.Storage/storageAccounts/{name}")
+    }
+
+    fn ev(resource: &str, control: &str, outcome: EvalOutcome, at: DateTime<Utc>, lane: &str) -> Evaluation {
+        Evaluation {
+            id: format!("{resource}:{control}"),
+            observation_id: format!("obs-{resource}"),
+            resource_id: ResourceId::new(resource),
+            control_id: control.into(),
+            control_revision: "1".into(),
+            outcome,
+            severity: Severity::High,
+            evidence: json!({ "clause_revision": "1", "lane": lane }),
+            evaluated_at: at,
+            environment: EnvironmentClass::Prod,
+            detail: String::new(),
+        }
+    }
+
+    async fn empty_app() -> (axum::Router, String, AppState) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = AppState::bootstrap_in(dir.path().to_path_buf())
+            .await
+            .expect("bootstrap");
+        let _kept = dir.keep();
+        let token = state.session_token.clone();
+        (router(state.clone()), token, state)
+    }
+
+    async fn observe(pool: &sqlx::SqlitePool, sub: &str, name: &str, tags: Value) {
+        let r = rid(sub, name);
+        db::insert_observation(
+            pool,
+            &ResourceObservation {
+                id: format!("obs-{r}"),
+                provider: Provider::Azure,
+                resource_id: ResourceId::new(r.clone()),
+                tenant_id: TenantId::new("tenant-fabrikam"),
+                subscription_id: SubscriptionId::new(sub),
+                resource_type: "Microsoft.Storage/storageAccounts".into(),
+                name: format!("{name}-{sub}"),
+                location: Some("eastus".into()),
+                resource_group: Some("rg-app".into()),
+                tags,
+                properties: json!({}),
+                scan_id: "scan-1".into(),
+                observation_time: Utc::now(),
+                evidence_available: true,
+                lifecycle_epoch: 1,
+                arm_meta: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        db::insert_change_event(
+            pool,
+            &ChangeEvent {
+                id: format!("chg-{sub}-{name}"),
+                resource_id: ResourceId::new(r.clone()),
+                subscription_id: SubscriptionId::new(sub),
+                source_event_id: Some(format!("test:{sub}:{name}")),
+                label: ChangeLabel::Updated,
+                times: DualTime::observed_now(),
+                before: None,
+                after: None,
+                property_diffs: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Tracked: `a` fails SEC-1 (security, opened 1h ago) and TAG-1 (hygiene); `b` fails SEC-1
+    /// (opened 9 days ago); `c` passes SEC-2. Untracked: `x` fails OUT-1 and SEC-1.
+    /// One finished scan, one coverage gap, one active exception per subscription.
+    async fn seeded() -> (axum::Router, String, AppState) {
+        let (app, token, state) = empty_app().await;
+        let pool = &state.pool;
+        db::upsert_tenant(
+            pool,
+            &TenantInfo {
+                id: TenantId::new("tenant-fabrikam"),
+                name: "Fabrikam".into(),
+                needs_sign_in: false,
+                last_refresh: Some(Utc::now()),
+                access_issue: None,
+            },
+        )
+        .await
+        .unwrap();
+        for (id, decision) in [(TRACKED, DecisionKind::Track), (UNTRACKED, DecisionKind::Exclude)] {
+            db::upsert_subscription(
+                pool,
+                &SubscriptionInfo {
+                    id: SubscriptionId::new(id),
+                    tenant_id: TenantId::new("tenant-fabrikam"),
+                    name: format!("{id}-name"),
+                    state: "Enabled".into(),
+                    quota_id: None,
+                    tags: json!({}),
+                    access_issue: None,
+                    last_refresh: Some(Utc::now()),
+                },
+            )
+            .await
+            .unwrap();
+            db::insert_scope_decision(
+                pool,
+                &ScopeDecision {
+                    id: format!("decision-{id}"),
+                    provider: Provider::Azure,
+                    tenant_id: TenantId::new("tenant-fabrikam"),
+                    subscription_id: Some(SubscriptionId::new(id)),
+                    decision,
+                    source: DecisionSource::Explicit,
+                    matching_rule_id: None,
+                    reason: None,
+                    effective_from: Utc::now(),
+                    effective_to: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        observe(pool, TRACKED, "a", json!({ "app": "Payments", "owner": "team-a", "lob": "11.3" })).await;
+        // A pathological LOB tag value that is itself a resource ID (readout must redact it).
+        observe(pool, TRACKED, "b", json!({ "app": "Ledger", "owner": "team-b", "lob": rid(TRACKED, "b") })).await;
+        observe(pool, TRACKED, "c", json!({})).await;
+        observe(pool, UNTRACKED, "x", json!({ "app": "Hidden", "owner": "team-x", "lob": "99" })).await;
+        state.settings.write().await.ownership = Some(OwnershipConfig {
+            application_tag: Some("app".into()),
+            owner_tag: Some("owner".into()),
+            line_of_business_tag: Some("lob".into()),
+            lob_rollup_pattern: Some(r"^\d+".into()),
+            lob_names: [("11".to_string(), "Retail".to_string())].into_iter().collect(),
+            ..Default::default()
+        });
+
+        let scan = db::create_scan_run(pool, "test").await.unwrap();
+        let now = Utc::now();
+        let recent = now - Duration::hours(1);
+        let old = now - Duration::days(9);
+        db::save_policy_pack(pool, "PACK-1", "Pack", "1", None, Some("test"), true, &json!({}))
+            .await
+            .unwrap();
+        db::record_pack_evaluation(
+            pool,
+            &scan,
+            "PACK-1",
+            "1",
+            &HashSet::new(),
+            &PackEvaluation {
+                evaluations: vec![
+                    ev(&rid(TRACKED, "a"), "SEC-1", EvalOutcome::Fail, recent, "security"),
+                    ev(&rid(TRACKED, "a"), "TAG-1", EvalOutcome::Fail, recent, "hygiene"),
+                    ev(&rid(TRACKED, "b"), "SEC-1", EvalOutcome::Fail, old, "security"),
+                    ev(&rid(TRACKED, "c"), "SEC-2", EvalOutcome::Pass, recent, "security"),
+                    ev(&rid(UNTRACKED, "x"), "OUT-1", EvalOutcome::Fail, recent, "security"),
+                    ev(&rid(UNTRACKED, "x"), "SEC-1", EvalOutcome::Fail, recent, "security"),
+                ],
+                coverage_gaps: vec![CoverageGap {
+                    pack_id: "PACK-1".into(),
+                    control_id: "GAP-1".into(),
+                    category: GapCategory::OutsideAzure,
+                    note: "evidence lives in the CMDB".into(),
+                    resource_type: None,
+                    resource_count: 0,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        db::finish_scan_run(pool, &scan, "complete", None).await.unwrap();
+        for (id, sub) in [("ex-tracked", TRACKED), ("ex-untracked", UNTRACKED)] {
+            db::insert_exception(
+                pool,
+                &ExceptionRecord {
+                    id: id.into(),
+                    control_id: "SEC-1".into(),
+                    resource_id: None,
+                    subscription_id: Some(sub.into()),
+                    resource_group: None,
+                    reason: Some("accepted risk".into()),
+                    approved_by: Some("ciso".into()),
+                    ticket_ref: None,
+                    expires_at: None,
+                    created_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        (app, token, state)
+    }
+
+    async fn call(app: &axum::Router, token: &str, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-session-token", token)
+            .header("origin", "http://127.0.0.1:8787");
+        let body = match body {
+            Some(b) => {
+                req = req.header("content-type", "application/json");
+                Body::from(b.to_string())
+            }
+            None => Body::empty(),
+        };
+        let res = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    async fn get(app: &axum::Router, token: &str, uri: &str) -> Value {
+        let (s, v) = call(app, token, "GET", uri, None).await;
+        assert_eq!(s, StatusCode::OK, "{uri}: {v}");
+        v
+    }
+
+    fn controls(v: &Value) -> Vec<String> {
+        let mut c: Vec<String> = v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["control_id"].as_str().unwrap().to_string())
+            .collect();
+        c.sort();
+        c.dedup();
+        c
+    }
+
+    #[tokio::test]
+    async fn reporting_endpoints_require_session() {
+        let (app, _, _) = empty_app().await;
+        for path in [
+            "/api/compliance/queue",
+            "/api/compliance/aging",
+            "/api/compliance/flow",
+            "/api/compliance/trend",
+        ] {
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            assert_eq!(
+                app.clone().oneshot(req).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "{path}"
+            );
+        }
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/evidence/export")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"format":"readout"}"#))
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ac_p6_1_queue_security_lane_excludes_hygiene_and_is_the_default() {
+        let (app, token, _) = seeded().await;
+        let default = get(&app, &token, "/api/compliance/queue").await;
+        assert_eq!(default["lane"], "security");
+        assert_eq!(controls(&default), vec!["SEC-1"]);
+        let row = &default["rows"][0];
+        assert_eq!(row["lane"], "security");
+        assert_eq!(row["count"], 2);
+        assert_eq!(row["subscriptions"], 1, "untracked subscription is out of scope");
+        assert_eq!(row["environment"], "prod");
+        assert_eq!(row["group_key"], "");
+
+        let sec = get(&app, &token, "/api/compliance/queue?lane=security").await;
+        assert_eq!(sec["rows"], default["rows"]);
+        let hyg = get(&app, &token, "/api/compliance/queue?lane=hygiene").await;
+        assert_eq!(controls(&hyg), vec!["TAG-1"]);
+        assert_eq!(hyg["rows"][0]["lane"], "hygiene");
+        let all = get(&app, &token, "/api/compliance/queue?lane=all").await;
+        assert_eq!(controls(&all), vec!["SEC-1", "TAG-1"]);
+
+        for bad in ["/api/compliance/queue?lane=bogus", "/api/compliance/queue?group_by=bogus"] {
+            let (s, _) = call(&app, &token, "GET", bad, None).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_p6_1_inbox_default_view_uses_security_lane() {
+        let (app, token, _) = seeded().await;
+        let row_controls = |inbox: &Value, name: &str| -> Vec<String> {
+            let row = inbox["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["change"]["resource_id"] == rid(TRACKED, name))
+                .unwrap_or_else(|| panic!("row {name} in {inbox}"));
+            row["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["finding"]["control_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let inbox = get(&app, &token, "/api/inbox").await;
+        assert_eq!(inbox["filter"]["lane"], "security");
+        assert_eq!(row_controls(&inbox, "a"), vec!["SEC-1"], "hygiene hidden by default");
+        let inbox = get(&app, &token, "/api/inbox?lane=all").await;
+        assert_eq!(inbox["filter"]["lane"], "all");
+        let mut both = row_controls(&inbox, "a");
+        both.sort();
+        assert_eq!(both, vec!["SEC-1", "TAG-1"]);
+        let inbox = get(&app, &token, "/api/inbox?lane=hygiene").await;
+        assert_eq!(row_controls(&inbox, "a"), vec!["TAG-1"]);
+        let (s, _) = call(&app, &token, "GET", "/api/inbox?lane=bogus", None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn ac_p6_2_queue_new_since_last_visit_reads_meta_last_visit() {
+        let (app, token, state) = seeded().await;
+        // `a` opened 1h ago, `b` 9 days ago: a visit 2 days ago makes only `a` new.
+        let visit = Utc::now() - Duration::days(2);
+        db::meta_set(&state.pool, "last_visit", &visit.to_rfc3339()).await.unwrap();
+        let q = get(&app, &token, "/api/compliance/queue").await;
+        assert_eq!(q["rows"][0]["count"], 2);
+        assert_eq!(q["rows"][0]["new_since_last_visit"], 1);
+        // The queue reads the visit marker but does not move it (only the inbox does).
+        let q = get(&app, &token, "/api/compliance/queue").await;
+        assert_eq!(q["rows"][0]["new_since_last_visit"], 1);
+        // Same count through the ownership (Rust) aggregation path.
+        let q = get(&app, &token, "/api/compliance/queue?group_by=owner").await;
+        let total: u64 = q["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["new_since_last_visit"].as_u64().unwrap())
+            .sum();
+        assert_eq!(total, 1);
+    }
+
+    #[tokio::test]
+    async fn queue_group_by_uses_derived_ownership_and_subscription_names() {
+        let (app, token, _) = seeded().await;
+        let keys = |v: &Value| -> Vec<(String, u64)> {
+            let mut k: Vec<(String, u64)> = v["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| (r["group_key"].as_str().unwrap().to_string(), r["count"].as_u64().unwrap()))
+                .collect();
+            k.sort();
+            k
+        };
+        let by_app = get(&app, &token, "/api/compliance/queue?group_by=application").await;
+        assert_eq!(by_app["group_by"], "application");
+        assert_eq!(keys(&by_app), vec![("Ledger".into(), 1), ("Payments".into(), 1)]);
+        let by_owner = get(&app, &token, "/api/compliance/queue?group_by=owner").await;
+        assert_eq!(keys(&by_owner), vec![("team-a".into(), 1), ("team-b".into(), 1)]);
+        let by_lob = get(&app, &token, "/api/compliance/queue?group_by=line_of_business").await;
+        assert!(keys(&by_lob).contains(&("Retail".into(), 1)), "{by_lob}");
+        let by_sub = get(&app, &token, "/api/compliance/queue?group_by=subscription").await;
+        assert_eq!(keys(&by_sub), vec![(format!("{TRACKED}-name"), 2)]);
+    }
+
+    #[tokio::test]
+    async fn ac_p6_3_and_4_aging_and_flow_endpoints() {
+        let (app, token, _) = seeded().await;
+        let aging = get(&app, &token, "/api/compliance/aging").await;
+        assert_eq!(aging["buckets"], json!(["0-7", "8-30", "31-90", "90+"]));
+        let got: Vec<(String, String, u64)> = aging["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["control_id"].as_str().unwrap().into(),
+                    r["bucket"].as_str().unwrap().into(),
+                    r["count"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![("SEC-1".into(), "0-7".into(), 1), ("SEC-1".into(), "8-30".into(), 1)]
+        );
+        let aging_hyg = get(&app, &token, "/api/compliance/aging?lane=hygiene").await;
+        assert_eq!(controls(&aging_hyg), vec!["TAG-1"]);
+
+        let flow = get(&app, &token, "/api/compliance/flow?days=90").await;
+        assert_eq!(flow["days"], 90);
+        let opened: u64 = flow["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["opened"].as_u64().unwrap())
+            .sum();
+        assert_eq!(opened, 2, "two security fails opened in the window: {flow}");
+        // A 1-day window drops the fail opened 9 days ago.
+        let flow = get(&app, &token, "/api/compliance/flow?days=1").await;
+        let opened: u64 = flow["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["opened"].as_u64().unwrap())
+            .sum();
+        assert!(opened <= 1, "{flow}");
+
+        let trend = get(&app, &token, "/api/compliance/trend").await;
+        assert_eq!(trend["scans"].as_array().unwrap().len(), 1);
+        assert_eq!(trend["rows"][0]["control_id"], "SEC-1");
+        assert_eq!(trend["rows"][0]["open"], 2);
+    }
+
+    #[tokio::test]
+    async fn ac_p6_5_readout_export_has_aggregates_and_no_resource_ids() {
+        let (app, token, _) = seeded().await;
+        let (s, out) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/evidence/export",
+            Some(json!({ "format": "readout" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(!text.to_lowercase().contains("/subscriptions/"), "{text}");
+        assert!(!text.contains(TRACKED) && !text.contains(UNTRACKED), "no subscription IDs: {text}");
+        assert_eq!(out["format"], "readout");
+        assert_eq!(out["scope_empty"], false);
+        assert_eq!(out["scope_size"], 1);
+        assert_eq!(out["open_findings"], 3);
+        assert_eq!(out["by_lane"], json!({ "open": 3, "security": 2, "hygiene": 1 }));
+        assert_eq!(out["by_control"][0], json!({ "control_id": "SEC-1", "lane": "security", "open": 2 }));
+        assert_eq!(out["by_environment"][0]["environment"], "prod");
+        assert_eq!(out["by_environment"][0]["open"], 3);
+        let lobs: Vec<&str> = out["by_line_of_business"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["line_of_business"].as_str().unwrap())
+            .collect();
+        assert!(lobs.contains(&"Retail"), "{lobs:?}");
+        assert!(lobs.contains(&"[redacted]"), "a resource-ID-like tag value is redacted: {lobs:?}");
+        assert_eq!(out["trend"].as_array().unwrap().len(), 1);
+        assert_eq!(out["trend"][0]["open"], 3);
+        assert_eq!(
+            out["coverage_gap_categories"],
+            json!([{ "category": "outside_azure", "controls": 1, "resources": 0 }])
+        );
+        assert_eq!(out["exceptions"], 1, "only the tracked subscription's exception");
+        assert!(!out["freshness"]["last_scan_at"].is_null());
+        assert!(out.get("findings").is_none() && out.get("resource").is_none());
+    }
+
+    #[tokio::test]
+    async fn readout_with_empty_scope_returns_zero_counts_and_scope_empty() {
+        let (app, token, state) = empty_app().await;
+        // Findings exist, but no subscription is tracked.
+        db::record_pack_evaluation(
+            &state.pool,
+            "scan-1",
+            "PACK-1",
+            "1",
+            &HashSet::new(),
+            &PackEvaluation {
+                evaluations: vec![ev(&rid(UNTRACKED, "x"), "SEC-1", EvalOutcome::Fail, Utc::now(), "security")],
+                coverage_gaps: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let (s, out) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/evidence/export",
+            Some(json!({ "format": "readout" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(out["scope_empty"], true);
+        assert_eq!(out["scope_size"], 0);
+        assert_eq!(out["open_findings"], 0);
+        assert_eq!(out["by_lane"]["open"], 0);
+        assert_eq!(out["exceptions"], 0);
+        for k in ["by_control", "by_environment", "by_line_of_business", "trend", "coverage_gap_categories"] {
+            assert!(out[k].as_array().unwrap().is_empty(), "{k}: {out}");
+        }
+        for uri in [
+            "/api/compliance/queue?lane=all",
+            "/api/compliance/aging?lane=all",
+            "/api/compliance/flow?lane=all",
+            "/api/compliance/trend?lane=all",
+        ] {
+            assert!(get(&app, &token, uri).await["rows"].as_array().unwrap().is_empty(), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_p6_6_every_reporting_endpoint_excludes_untracked_subscriptions() {
+        let (app, token, _) = seeded().await;
+        let mut uris: Vec<String> = Vec::new();
+        for lane in ["security", "hygiene", "all"] {
+            for g in ["", "application", "owner", "subscription", "line_of_business"] {
+                uris.push(format!("/api/compliance/queue?lane={lane}&group_by={g}"));
+            }
+            uris.push(format!("/api/compliance/aging?lane={lane}"));
+            uris.push(format!("/api/compliance/flow?lane={lane}&days=90"));
+            uris.push(format!("/api/compliance/trend?lane={lane}"));
+        }
+        for uri in &uris {
+            let v = get(&app, &token, uri).await;
+            let text = v.to_string();
+            assert!(!text.contains("OUT-1"), "{uri}: {text}");
+            assert!(!text.contains("Hidden") && !text.contains("team-x"), "{uri}: {text}");
+            assert!(!text.contains(UNTRACKED), "{uri}: {text}");
+        }
+        // SEC-1 also fails in the untracked subscription; only the tracked fails are counted.
+        let all = get(&app, &token, "/api/compliance/queue?lane=all").await;
+        let sec = all["rows"].as_array().unwrap().iter().find(|r| r["control_id"] == "SEC-1").unwrap();
+        assert_eq!(sec["count"], 2);
+        let trend = get(&app, &token, "/api/compliance/trend").await;
+        assert_eq!(trend["rows"][0]["open"], 2);
+
+        let (_, readout) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/evidence/export",
+            Some(json!({ "format": "readout" })),
+        )
+        .await;
+        let text = readout.to_string();
+        assert!(!text.contains("OUT-1") && !text.contains("\"99\""), "{text}");
     }
 }
