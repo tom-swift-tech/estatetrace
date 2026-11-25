@@ -1,0 +1,324 @@
+# Fictional Azure baseline: a worked example of the pack schema's evaluator features.
+#
+# Control IDs and the standard are fictional. Every Azure property path below was checked
+# against real Resource Graph evidence before it was used here; `when_absent` values are the
+# Azure defaults applied when the property is not reported.
+#
+# Features shown: resource_kind targets, all_of, when_absent, context, filter, ordinal_gte,
+# count_where_eq, environments, lanes, not_evaluated and a deep-only target.
+schema_version: 1
+id: EXAMPLE-AZURE-BASELINE
+name: Example Azure Baseline (fictional)
+revision: "1"
+owner: Cloud Governance
+controls:
+  - id: BASE-NET-001
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "2.1" }
+    owner: Network Engineering
+    severity: high
+    status: verified
+    judges: Whether IP forwarding is enabled on each network interface.
+    fix: Disable IP forwarding, or record the network virtual appliance as an exception
+    targets:
+      - resource_kind: network_interface
+        check:
+          name: IP forwarding
+          field: properties.enableIPForwarding
+          operator: equals
+          value: false
+          when_absent: false
+
+  - id: BASE-NET-002
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "2.2" }
+    owner: Network Engineering
+    severity: medium
+    status: verified
+    judges: Whether the firewall bypass on storage accounts and Key Vaults includes Azure trusted services.
+    fix: Set the network rule bypass to include AzureServices
+    targets:
+      - resource_kind: storage_account
+        check:
+          name: trusted services bypass
+          field: properties.networkAcls.bypass
+          operator: matches
+          value: AzureServices
+          when_absent: AzureServices
+          context:
+            - { label: region, field: location }
+      - resource_kind: key_vault
+        check:
+          name: trusted services bypass
+          field: properties.networkAcls.bypass
+          operator: matches
+          value: AzureServices
+          when_absent: AzureServices
+
+  - id: BASE-DATA-003
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "3.1" }
+    owner: Data Platform
+    severity: high
+    status: verified
+    judges: The minimum TLS version on SQL servers, Redis caches and Event Hubs namespaces. A resource that does not report it is unknown.
+    fix: Set the minimum TLS version to 1.2 or higher
+    targets:
+      - resource_kind: sql_server
+        check:
+          field: properties.minimalTlsVersion
+          operator: ordinal_gte
+          order: ["None", "1.0", "1.1", "1.2", "1.3"]
+          value: "1.2"
+      - resource_kind: redis_cache
+        check:
+          field: properties.minimumTlsVersion
+          operator: ordinal_gte
+          order: ["None", "1.0", "1.1", "1.2", "1.3"]
+          value: "1.2"
+      - resource_kind: event_hub_namespace
+        check:
+          field: properties.minimumTlsVersion
+          operator: ordinal_gte
+          order: ["None", "1.0", "1.1", "1.2", "1.3"]
+          value: "1.2"
+
+  - id: BASE-KV-004
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "4.1" }
+    owner: Security Engineering
+    severity: high
+    status: verified
+    judges: Purge protection and soft delete flags on each Key Vault. It does not prove recovery works.
+    fix: Enable purge protection and soft delete
+    targets:
+      - resource_kind: key_vault
+        check:
+          all_of:
+            - { name: purge protection, field: properties.enablePurgeProtection, operator: equals, value: true, when_absent: false }
+            - { name: soft delete, field: properties.enableSoftDelete, operator: equals, value: true, when_absent: true }
+
+  - id: BASE-ACR-005
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "4.2" }
+    owner: Platform Engineering
+    severity: medium
+    status: verified
+    fix: Disable the admin user on the registry
+    targets:
+      - resource_kind: container_registry
+        check: { name: admin user, field: properties.adminUserEnabled, operator: equals, value: false, when_absent: false }
+
+  - id: BASE-AKS-006
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "4.3" }
+    owner: Platform Engineering
+    severity: high
+    status: verified
+    fix: Recreate the cluster as a private cluster
+    targets:
+      - resource_kind: kubernetes_service
+        check: { name: private cluster, field: properties.apiServerAccessProfile.enablePrivateCluster, operator: equals, value: true, when_absent: false }
+
+  - id: BASE-VM-007
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "5.1" }
+    owner: Compute Engineering
+    severity: medium
+    status: verified
+    judges: Whether the operating system disk and every data disk of each virtual machine is a managed disk.
+    fix: Convert unmanaged disks to managed disks
+    targets:
+      - resource_kind: virtual_machine
+        check:
+          all_of:
+            - { name: operating system disk, field: properties.storageProfile.osDisk.managedDisk, operator: exists }
+            - name: data disks
+              field: properties.storageProfile.dataDisks
+              operator: count_where_eq
+              where: { field: managedDisk, empty: true }
+              value: 0
+              note: data disks that are not managed disks
+
+  - id: BASE-LOG-008
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "6.1" }
+    owner: Security Operations
+    severity: medium
+    status: verified
+    fix: Disable public network access for ingestion and query on the workspace
+    targets:
+      - resource_kind: log_analytics_workspace
+        check:
+          all_of:
+            - { name: ingestion, field: properties.publicNetworkAccessForIngestion, operator: equals, value: Disabled, when_absent: Enabled }
+            - { name: query, field: properties.publicNetworkAccessForQuery, operator: equals, value: Disabled, when_absent: Enabled }
+
+  - id: BASE-AVD-009
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "7.1" }
+    owner: End User Computing
+    severity: low
+    status: verified
+    judges: The load-balancing type of pooled host pools. Personal host pools are not selected.
+    fix: Use depth-first load balancing
+    targets:
+      - resource_kind: avd_host_pool
+        filter: { field: properties.hostPoolType, operator: equals, value: Pooled }
+        check: { field: properties.loadBalancerType, operator: equals, value: DepthFirst }
+
+  - id: BASE-ACA-010
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "8.1" }
+    owner: Platform Engineering
+    severity: high
+    status: verified
+    fix: Deploy the environment into a virtual network subnet
+    targets:
+      - resource_kind: container_app_environment
+        check: { name: infrastructure subnet, field: properties.vnetConfiguration.infrastructureSubnetId, operator: exists }
+
+  - id: BASE-ACA-011
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "8.2" }
+    owner: Platform Engineering
+    severity: high
+    status: verified
+    fix: Replace inline secrets with Key Vault references
+    targets:
+      - resource_kind: container_app
+        check:
+          name: inline secrets
+          field: properties.configuration.secrets
+          operator: count_where_eq
+          where: { field: keyVaultUrl, empty: true }
+          value: 0
+          note: secrets that are not Key Vault references
+
+  - id: BASE-GEO-012
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "1.1" }
+    owner: Cloud Platform
+    severity: medium
+    applies_to: { environments: [prod] }
+    fix: Move the resource to an approved region, or record an exception
+    check: { name: region, field: location, operator: in, value: [eastus, eastus2, centralus] }
+
+  - id: BASE-TAG-013
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "1.2" }
+    owner: Cloud Finance
+    severity: low
+    lane: hygiene
+    applies_to: { capability: supports_tags }
+    fix: Add a cost-center tag
+    check: { field: tags.cost-center, operator: nonempty }
+
+  - id: BASE-GOV-014
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "9.1" }
+    owner: Identity Governance
+    severity: medium
+    not_evaluated:
+      category: outside_azure
+      note: Needs quarterly access review records from the identity governance tool
+
+  - id: BASE-DIAG-015
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "6.2" }
+    owner: Security Operations
+    severity: medium
+    judges: Whether each storage account sends diagnostics to a workspace. Diagnostic settings need a per-resource call.
+    targets:
+      - resource_kind: storage_account
+        check: { field: deep.diagnosticSettings, operator: count_gte, value: 1, evidence_source: deep }
+
+example_cases:
+  - control_id: BASE-NET-001
+    name: forwarding off
+    resource: { type: Microsoft.Network/networkInterfaces, properties: { enableIPForwarding: false } }
+    expected: pass
+  - control_id: BASE-NET-001
+    name: forwarding on
+    resource: { type: Microsoft.Network/networkInterfaces, properties: { enableIPForwarding: true } }
+    expected: fail
+  - control_id: BASE-NET-001
+    name: property absent, Azure default (off) assumed
+    resource: { type: Microsoft.Network/networkInterfaces, properties: {} }
+    expected: pass
+  - control_id: BASE-NET-002
+    name: storage bypass without trusted services
+    resource: { type: Microsoft.Storage/storageAccounts, location: eastus, properties: { networkAcls: { bypass: None, defaultAction: Deny } } }
+    expected: fail
+  - control_id: BASE-NET-002
+    name: key vault bypass includes trusted services
+    resource: { type: Microsoft.KeyVault/vaults, properties: { networkAcls: { bypass: AzureServices } } }
+    expected: pass
+  - control_id: BASE-DATA-003
+    name: sql at 1.2
+    resource: { type: Microsoft.Sql/servers, properties: { minimalTlsVersion: "1.2" } }
+    expected: pass
+  - control_id: BASE-DATA-003
+    name: redis at 1.0
+    resource: { type: Microsoft.Cache/Redis, properties: { minimumTlsVersion: "1.0" } }
+    expected: fail
+  - control_id: BASE-DATA-003
+    name: sql does not report the setting
+    resource: { type: Microsoft.Sql/servers, properties: {} }
+    expected: unknown
+  - control_id: BASE-KV-004
+    name: purge protection absent, default (off) assumed
+    resource: { type: Microsoft.KeyVault/vaults, properties: { enableSoftDelete: true } }
+    expected: fail
+  - control_id: BASE-KV-004
+    name: both enabled
+    resource: { type: Microsoft.KeyVault/vaults, properties: { enablePurgeProtection: true, enableSoftDelete: true } }
+    expected: pass
+  - control_id: BASE-ACR-005
+    name: admin user enabled
+    resource: { type: Microsoft.ContainerRegistry/registries, properties: { adminUserEnabled: true } }
+    expected: fail
+  - control_id: BASE-AKS-006
+    name: public cluster by default
+    resource: { type: Microsoft.ContainerService/managedClusters, properties: {} }
+    expected: fail
+  - control_id: BASE-VM-007
+    name: one unmanaged data disk
+    resource:
+      type: Microsoft.Compute/virtualMachines
+      properties:
+        storageProfile:
+          osDisk: { managedDisk: { storageAccountType: Premium_LRS } }
+          dataDisks:
+            - { lun: 0, managedDisk: { storageAccountType: Premium_LRS } }
+            - { lun: 1, vhd: { uri: "https://example.invalid/disk1.vhd" } }
+    expected: fail
+  - control_id: BASE-LOG-008
+    name: both paths disabled
+    resource: { type: Microsoft.OperationalInsights/workspaces, properties: { publicNetworkAccessForIngestion: Disabled, publicNetworkAccessForQuery: Disabled } }
+    expected: pass
+  - control_id: BASE-AVD-009
+    name: pooled breadth-first
+    resource: { type: Microsoft.DesktopVirtualization/hostpools, properties: { hostPoolType: Pooled, loadBalancerType: BreadthFirst } }
+    expected: fail
+  - control_id: BASE-ACA-010
+    name: no infrastructure subnet
+    resource: { type: Microsoft.App/managedEnvironments, properties: { vnetConfiguration: { internal: false } } }
+    expected: fail
+  - control_id: BASE-ACA-011
+    name: one inline secret
+    resource:
+      type: Microsoft.App/containerApps
+      properties:
+        configuration:
+          secrets:
+            - { name: db-conn }
+            - { name: api-key, keyVaultUrl: "https://example-kv.vault.azure.net/secrets/api-key", identity: system }
+    expected: fail
+  - control_id: BASE-GEO-012
+    name: blocked region in prod
+    environment: prod
+    resource: { type: Microsoft.Web/sites, location: westus }
+    expected: fail
+  - control_id: BASE-GEO-012
+    name: blocked region in nonprod is out of scope
+    environment: nonprod
+    resource: { type: Microsoft.Web/sites, location: westus }
+    expected: inapplicable
+  - control_id: BASE-TAG-013
+    name: tag present
+    resource: { type: Microsoft.Web/sites, tags: { cost-center: CC-1001 } }
+    expected: pass
+  - control_id: BASE-TAG-013
+    name: tags not readable
+    resource: { type: Microsoft.Web/sites }
+    expected: unknown
+  - control_id: BASE-GOV-014
+    name: never evaluated per resource
+    resource: { type: Microsoft.Web/sites }
+    expected: unknown

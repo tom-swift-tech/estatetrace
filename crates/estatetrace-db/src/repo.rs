@@ -936,8 +936,21 @@ pub async fn list_evaluations(pool: &SqlitePool, limit: i64) -> Result<Vec<Evalu
     .await?;
     Ok(rows
         .into_iter()
-        .map(
-            |(id, oid, rid, cid, crev, outcome, sev, evidence, at)| Evaluation {
+        .map(|(id, oid, rid, cid, crev, outcome, sev, evidence, at)| {
+            let evidence: Value = serde_json::from_str(&evidence).unwrap_or(Value::Null);
+            // `detail` and `environment` live in evidence_json until the findings store replaces
+            // this table (spec §4.4); older rows have neither.
+            let detail = evidence
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let environment = evidence
+                .get("environment")
+                .and_then(|v| v.as_str())
+                .and_then(EnvironmentClass::parse)
+                .unwrap_or(EnvironmentClass::Unknown);
+            Evaluation {
                 id,
                 observation_id: oid,
                 resource_id: ResourceId::new(rid),
@@ -945,12 +958,14 @@ pub async fn list_evaluations(pool: &SqlitePool, limit: i64) -> Result<Vec<Evalu
                 control_revision: crev,
                 outcome: EvalOutcome::parse(&outcome).unwrap_or(EvalOutcome::Unknown),
                 severity: Severity::parse(&sev).unwrap_or(Severity::Medium),
-                evidence: serde_json::from_str(&evidence).unwrap_or(Value::Null),
+                evidence,
                 evaluated_at: DateTime::parse_from_rfc3339(&at)
                     .map(|d| d.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now()),
-            },
-        )
+                environment,
+                detail,
+            }
+        })
         .collect())
 }
 
@@ -1532,5 +1547,74 @@ pub async fn get_resource_group_tags(
                 .map(|d| d.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now()),
         })
+        .collect())
+}
+
+/// Replace the stored coverage gaps of one pack with this scan's gaps (spec §4.4, AC-P1-8).
+/// Runs in one transaction, so readers never see a half-written set.
+pub async fn replace_coverage_gaps(
+    pool: &SqlitePool,
+    pack_id: &str,
+    pack_revision: &str,
+    scan_id: &str,
+    gaps: &[CoverageGap],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM coverage_gaps WHERE pack_id = ?")
+        .bind(pack_id)
+        .execute(&mut *tx)
+        .await?;
+    for g in gaps {
+        sqlx::query(
+            "INSERT INTO coverage_gaps(pack_id, pack_revision, control_id, resource_type, category, note, resource_count, recorded_scan_id)
+             VALUES(?,?,?,?,?,?,?,?)
+             ON CONFLICT(pack_id, control_id, resource_type) DO UPDATE SET
+               pack_revision=excluded.pack_revision,
+               category=excluded.category,
+               note=excluded.note,
+               resource_count=excluded.resource_count,
+               recorded_scan_id=excluded.recorded_scan_id",
+        )
+        .bind(pack_id)
+        .bind(pack_revision)
+        .bind(&g.control_id)
+        .bind(g.resource_type.as_deref().unwrap_or(""))
+        .bind(g.category.as_str())
+        .bind(&g.note)
+        .bind(g.resource_count as i64)
+        .bind(scan_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Stored coverage gaps, optionally for one pack, ordered by pack, control and type.
+pub async fn list_coverage_gaps(
+    pool: &SqlitePool,
+    pack_id: Option<&str>,
+) -> Result<Vec<CoverageGap>> {
+    let rows = sqlx::query_as::<_, (String, String, String, String, String, i64)>(
+        "SELECT pack_id, control_id, resource_type, category, note, resource_count
+         FROM coverage_gaps
+         WHERE (?1 IS NULL OR pack_id = ?1)
+         ORDER BY pack_id, control_id, resource_type",
+    )
+    .bind(pack_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(pack_id, control_id, rtype, category, note, count)| CoverageGap {
+                pack_id,
+                control_id,
+                category: GapCategory::parse(&category).unwrap_or(GapCategory::MoreCollection),
+                note,
+                resource_type: if rtype.is_empty() { None } else { Some(rtype) },
+                resource_count: count.max(0) as u64,
+            },
+        )
         .collect())
 }

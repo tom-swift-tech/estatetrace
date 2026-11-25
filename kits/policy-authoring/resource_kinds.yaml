@@ -1,0 +1,124 @@
+# Resource kinds: the names a pack's `targets[].resource_kind` may use, and the Azure resource
+# type (as Resource Graph reports it, lowercase) each one selects.
+#
+#   arm_type  Resource Graph `type`, compared case-insensitively
+#   aliases   other names accepted for the kind
+#   filter    optional leaf check; a resource of arm_type is the kind only when it passes
+#
+# Generic Azure only. Built into the EstateTrace binary (estatetrace-policy `builtin_resource_kinds`).
+# Not listed on purpose: resource groups and subnets. EstateTrace collects the `Resources` table,
+# which has neither as rows, so a target on them would select nothing.
+kinds:
+  storage_account:
+    arm_type: microsoft.storage/storageaccounts
+    aliases: [storage]
+  key_vault:
+    arm_type: microsoft.keyvault/vaults
+  private_endpoint:
+    arm_type: microsoft.network/privateendpoints
+  function_app:
+    arm_type: microsoft.web/sites
+    # microsoft.web/sites also covers web apps; the top-level `kind` tells them apart.
+    filter: { field: kind, operator: matches, value: functionapp }
+  app_service:
+    arm_type: microsoft.web/sites
+  service_plan:
+    arm_type: microsoft.web/serverfarms
+    aliases: [app_service_plan]
+  virtual_network:
+    arm_type: microsoft.network/virtualnetworks
+  network_security_group:
+    arm_type: microsoft.network/networksecuritygroups
+  network_interface:
+    arm_type: microsoft.network/networkinterfaces
+  public_ip_address:
+    arm_type: microsoft.network/publicipaddresses
+  load_balancer:
+    arm_type: microsoft.network/loadbalancers
+  application_gateway:
+    arm_type: microsoft.network/applicationgateways
+  web_application_firewall:
+    arm_type: microsoft.network/applicationgatewaywebapplicationfirewallpolicies
+  azure_firewall:
+    arm_type: microsoft.network/azurefirewalls
+  route_table:
+    arm_type: microsoft.network/routetables
+  vpn_gateway:
+    arm_type: microsoft.network/virtualnetworkgateways
+  virtual_wan:
+    arm_type: microsoft.network/virtualwans
+  expressroute_circuit:
+    arm_type: microsoft.network/expressroutecircuits
+  private_dns_zone:
+    arm_type: microsoft.network/privatednszones
+  private_dns_vnet_link:
+    arm_type: microsoft.network/privatednszones/virtualnetworklinks
+  log_analytics_workspace:
+    arm_type: microsoft.operationalinsights/workspaces
+  application_insights:
+    arm_type: microsoft.insights/components
+  activity_log_alert:
+    arm_type: microsoft.insights/activitylogalerts
+  scheduled_query_rule:
+    arm_type: microsoft.insights/scheduledqueryrules
+  action_group:
+    arm_type: microsoft.insights/actiongroups
+  metric_alert:
+    arm_type: microsoft.insights/metricalerts
+  avd_host_pool:
+    arm_type: microsoft.desktopvirtualization/hostpools
+    aliases: [virtual_desktop_host_pool]
+  avd_application_group:
+    arm_type: microsoft.desktopvirtualization/applicationgroups
+    aliases: [virtual_desktop_application_group]
+  avd_workspace:
+    arm_type: microsoft.desktopvirtualization/workspaces
+    aliases: [virtual_desktop_workspace]
+  avd_scaling_plan:
+    arm_type: microsoft.desktopvirtualization/scalingplans
+    aliases: [virtual_desktop_scaling_plan]
+  container_app:
+    arm_type: microsoft.app/containerapps
+  container_app_environment:
+    arm_type: microsoft.app/managedenvironments
+  container_app_job:
+    arm_type: microsoft.app/jobs
+  container_registry:
+    arm_type: microsoft.containerregistry/registries
+  kubernetes_service:
+    arm_type: microsoft.containerservice/managedclusters
+    aliases: [aks]
+  virtual_machine:
+    arm_type: microsoft.compute/virtualmachines
+  virtual_machine_scale_set:
+    arm_type: microsoft.compute/virtualmachinescalesets
+  managed_disk:
+    arm_type: microsoft.compute/disks
+  vm_extension:
+    arm_type: microsoft.compute/virtualmachines/extensions
+  managed_identity:
+    arm_type: microsoft.managedidentity/userassignedidentities
+  sql_server:
+    arm_type: microsoft.sql/servers
+  sql_database:
+    arm_type: microsoft.sql/servers/databases
+  redis_cache:
+    arm_type: microsoft.cache/redis
+  event_hub_namespace:
+    arm_type: microsoft.eventhub/namespaces
+  azure_synapse_analytics:
+    arm_type: microsoft.synapse/workspaces
+  data_factory:
+    arm_type: microsoft.datafactory/factories
+  databricks_workspace:
+    arm_type: microsoft.databricks/workspaces
+  machine_learning_workspace:
+    arm_type: microsoft.machinelearningservices/workspaces
+  automation_account:
+    arm_type: microsoft.automation/automationaccounts
+  recovery_services_vault:
+    arm_type: microsoft.recoveryservices/vaults
+  service_fabric_cluster:
+    arm_type: microsoft.servicefabric/clusters
+  dedicated_hsm:
+    arm_type: microsoft.hardwaresecuritymodules/dedicatedhsms

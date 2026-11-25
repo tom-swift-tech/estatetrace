@@ -9,6 +9,7 @@ controls:
     owner: Cloud Finance
     effective_from: "2026-12-01"
     severity: medium
+    status: verified
     applies_to: { environment: prod, capability: supports_tags }
     check: { field: tags.CostCenter, operator: nonempty }
     azure_remediation: { effect: modify, when: absent, inherit_from: resource_group }
@@ -17,6 +18,7 @@ controls:
     source: { document: "Cloud Standard", revision: "3", clause: "4.3" }
     owner: Cloud Finance
     severity: medium
+    status: verified
     applies_to: { environment: prod, capability: supports_tags }
     check: { field: tags.CostCenter, operator: nonempty }
     azure_remediation: { effect: modify, when: absent, inherit_from: resource_group }
@@ -26,6 +28,7 @@ controls:
     source: { document: "Cloud Standard", revision: "3", clause: "5.1" }
     owner: Cloud Platform
     severity: high
+    status: verified
     applies_to: { environment: prod }
     check:
       field: location
@@ -37,6 +40,7 @@ controls:
     source: { document: "Cloud Standard", revision: "3", clause: "6.1" }
     owner: Cloud Security
     severity: high
+    status: verified
     applies_to: { environment: prod }
     check: { field: properties.diagnosticsWorkspace, operator: nonempty }
     azure_remediation: { effect: deployIfNotExists }
@@ -46,6 +50,7 @@ controls:
     source: { document: "Cloud Standard", revision: "3", clause: "7.4" }
     owner: Business Continuity
     severity: medium
+    status: verified
     applies_to: { environment: prod }
     check: { field: properties.backupEnrolled, operator: equals, value: true }
     manual: true

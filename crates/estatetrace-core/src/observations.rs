@@ -1,4 +1,6 @@
-use crate::{DualTime, EvalOutcome, Provider, ResourceId, Severity, SubscriptionId, TenantId};
+use crate::{
+    DualTime, EnvironmentClass, EvalOutcome, Provider, ResourceId, Severity, SubscriptionId, TenantId,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -90,6 +92,16 @@ pub struct Evaluation {
     pub severity: Severity,
     pub evidence: Value,
     pub evaluated_at: DateTime<Utc>,
+    /// Environment the resource was classified into when evaluated.
+    #[serde(default = "unknown_environment")]
+    pub environment: EnvironmentClass,
+    /// Human-readable reason for the outcome (empty on pass).
+    #[serde(default)]
+    pub detail: String,
+}
+
+fn unknown_environment() -> EnvironmentClass {
+    EnvironmentClass::Unknown
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

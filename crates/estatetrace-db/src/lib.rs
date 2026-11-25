@@ -34,6 +34,7 @@ pub async fn open_db(path: &Path) -> Result<SqlitePool> {
 /// Each runs once, inside a transaction, and is recorded in `schema_migrations`.
 /// Add new entries at the end; never edit or renumber an entry that has shipped.
 pub const MIGRATIONS: &[(i64, &str)] = &[
+    (2, include_str!("../migrations/002_coverage_gaps.sql")),
     (3, include_str!("../migrations/003_exception_scope.sql")),
     (4, include_str!("../migrations/004_classification.sql")),
 ];

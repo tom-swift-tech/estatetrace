@@ -324,6 +324,8 @@ mod tests {
             severity: Severity::Medium,
             evidence: json!({ "grace_period_hours": hours }),
             evaluated_at: at,
+            environment: crate::EnvironmentClass::Unknown,
+            detail: String::new(),
         }
     }
 
