@@ -1,0 +1,67 @@
+# Check map for the fictional EXAMPLE-WORKPLACE-CATALOG: binds each catalog control to
+# evidence a Reader-only Resource Graph scan can collect. The catalog itself is not edited.
+#
+# checks:          a control and how it is judged
+#   judges / fix:  plain words copied onto the compiled control
+#   variants:      compile the control once per variant; each adds a filter and may set its
+#                  own severity or level; the compiled control ID is <control_id>/<suffix>
+#   targets:       one per resource kind (resource_kinds.yaml); a single leaf, or all_of
+#   filter:        resources that fail it are left out of the control
+#   when_absent:   the value assumed when Azure does not report the property
+#   expected_setting: take the expected value from settings.yaml named_values
+# not_evaluated:   a control this scan cannot judge, and why
+#   category:      outside_azure | more_collection | by_construction | needs_decision | deep_collection
+#
+# verified: false compiles every control as `status: provisional` and warns. Set it to true
+# once the bindings were checked against real resources.
+kind: CheckMap
+catalog_id: EXAMPLE-WORKPLACE-CATALOG
+verified: false
+
+checks:
+  EXW-STG-01:
+    judges: The minimum TLS version and the anonymous blob access flag of each storage account.
+    fix: Set the minimum TLS version to TLS1_2 and disable anonymous blob access
+    targets:
+      - resource_kind: storage_account
+        all_of:
+          - name: minimum TLS
+            path: properties.minimumTlsVersion
+            operator: ordinal_gte
+            order: [TLS1_0, TLS1_1, TLS1_2]
+            expected: TLS1_2
+            when_absent: TLS1_0
+          - name: anonymous blob access
+            path: properties.allowBlobPublicAccess
+            operator: equals
+            expected: false
+            when_absent: true
+
+  EXW-AVD-02:
+    judges: The public network access setting of each host pool, against the approved list.
+    fix: Set public network access to an approved value
+    variants:
+      - suffix: pooled
+        title_suffix: pooled host pools
+        level: must
+        filter: { path: properties.hostPoolType, operator: equals, expected: Pooled }
+      - suffix: personal
+        title_suffix: personal host pools
+        level: should
+        filter: { path: properties.hostPoolType, operator: equals, expected: Personal }
+        note: Personal pools serve one user each, so the standard only recommends this.
+    targets:
+      - resource_kind: avd_host_pool
+        name: public network access
+        path: properties.publicNetworkAccess
+        operator: in
+        expected_setting: approved_host_pool_access
+        when_absent: Enabled
+
+not_evaluated:
+  EXW-IAM-03:
+    category: outside_azure
+    note: The signed review lives in the governance records system, not in Azure.
+  EXW-REG-04:
+    category: needs_decision
+    note: The approved region list has not been published; add it to settings named_values, then bind with expected_setting.

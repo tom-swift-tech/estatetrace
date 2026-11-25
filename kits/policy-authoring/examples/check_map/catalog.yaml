@@ -1,0 +1,51 @@
+# Fictional policy catalog: controls stated in prose, with no rule logic.
+# The organisation, document and control IDs are invented for the check-map example.
+# check_map.yaml binds each control to Azure evidence; see README.md.
+catalog:
+  catalog_id: EXAMPLE-WORKPLACE-CATALOG
+  catalog_version: "2.1"
+  title: Example Workplace Cloud Standard (fictional)
+  authoritative_document: Example Workplace Cloud Standard
+  issuing_department: Example Cloud Governance Office
+
+controls:
+  - control_id: EXW-STG-01
+    name: Storage accounts refuse weak TLS and anonymous blob access
+    requirement_level: must
+    policy_statement: >
+      Storage accounts must accept TLS 1.2 or later only, and must not allow anonymous
+      read access to blobs.
+    source:
+      - { document: Example Workplace Cloud Standard, section: "3.2" }
+    minimum_evidence:
+      - Minimum TLS version of each storage account
+      - Anonymous blob access setting of each storage account
+
+  - control_id: EXW-AVD-02
+    name: Virtual desktop host pools limit public network access
+    requirement_level: must_conditional
+    policy_statement: >
+      Pooled host pools must restrict public network access to an approved setting.
+      Personal host pools should do the same.
+    source:
+      - { document: Example Workplace Cloud Standard, section: "5.4" }
+    minimum_evidence:
+      - Public network access setting of each host pool
+
+  - control_id: EXW-IAM-03
+    name: Privileged access is reviewed every quarter
+    requirement_level: must
+    policy_statement: >
+      Owners must review privileged role assignments every quarter and keep the signed review.
+    source:
+      - { document: Example Workplace Cloud Standard, section: "2.1" }
+    minimum_evidence:
+      - Signed quarterly access review
+
+  - control_id: EXW-REG-04
+    name: Workloads run in approved regions
+    requirement_level: should
+    policy_statement: >
+      Workloads should run only in regions on the approved list kept by the governance office.
+    source:
+      - { document: Example Workplace Cloud Standard, section: "1.3" }

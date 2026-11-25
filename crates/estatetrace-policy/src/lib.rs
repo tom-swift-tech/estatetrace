@@ -1,11 +1,13 @@
 //! Policy pack schema, evaluator, and Azure Policy export helpers.
 
+mod compile;
 mod evaluator;
 mod export;
 mod joins;
 mod kinds;
 mod pack;
 
+pub use compile::*;
 pub use evaluator::*;
 pub use export::*;
 pub use joins::*;
