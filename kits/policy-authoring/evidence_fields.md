@@ -12,9 +12,34 @@ A check reads fields from a resource view built from the resource's Azure Resour
 | `resourceGroup` | Resource group name | Azure |
 | `name` | Resource name | Azure |
 | `properties.*` | Provider-specific properties, as Resource Graph reports them | Azure |
-| `join.<name>.*` | A related object joined to this resource (`evidence_source: join`). Not populated yet, so such leaves evaluate to unknown. | Azure |
+| `join.<name>.*` | A related object joined to this resource (`evidence_source: join`). See [Joins](#joins). | Azure |
 
 Path segments match exactly first, then ignoring case. A path that runs through a value that is not an object is treated as missing.
+
+## Joins
+
+Some evidence sits on a related resource. At evaluation time EstateTrace joins it into the view under `join.<name>`, built from the latest observations of the whole estate:
+
+| Resource | Joined as | From |
+| --- | --- | --- |
+| Private endpoint (`private_endpoint`) | `join.subnet` | `properties.subnet.id` |
+| Container Apps environment (`container_app_environment`) | `join.subnet` | `properties.vnetConfiguration.infrastructureSubnetId` |
+| Network interface (`network_interface`) | `join.subnet` | `properties.ipConfigurations[0].properties.subnet.id` |
+
+Subnets are not rows of their own in Resource Graph. The joined subnet is the entry from its virtual network's `properties.subnets[]`, so `join.subnet.*` has:
+
+| Field path | Meaning |
+| --- | --- |
+| `join.subnet.id` | Subnet ID |
+| `join.subnet.name` | Subnet name |
+| `join.subnet.type` | `microsoft.network/virtualnetworks/subnets` |
+| `join.subnet.properties.*` | Subnet properties as the VNet row reports them, for example `addressPrefix`, `networkSecurityGroup.id`, `routeTable.id`, `delegations`, `privateEndpointNetworkPolicies` |
+| `join.subnet.vnetId` | ID of the parent virtual network |
+| `join.subnet.vnetName` | Name of the parent virtual network |
+
+Subnet IDs match ignoring case. Mark every leaf that reads `join.*` with `evidence_source: join`. When the referenced subnet is not visible (its virtual network is in a subscription outside the scan scope, or was never collected), `join.subnet` is null and the leaf is `unknown` with the detail `joined subnet is outside the visible scope`. It is never `fail`. A Container Apps environment that is not VNet-injected, or a network interface that reports no subnet, has no `join` at all, and a `join` leaf on it is unknown with the same detail.
+
+Example cases cannot run the join themselves: the example's `resource` is used as the view, so write the joined object into it directly (`join: { subnet: {...} }`), or leave `join` out (or set `join: { subnet: null }`) to show the outside-scope unknown. See `BASE-NET-016` in [the baseline example](examples/azure_baseline_example.yaml).
 
 ## Targets and resource kinds
 
@@ -51,7 +76,7 @@ Optional on every leaf:
 - `when_absent`: the value Azure applies when the property is not reported (missing or null). The leaf is judged against it, and the detail ends with `(property absent; Azure default assumed)`. Use it only for documented Azure defaults.
 - `context: [{label, field}]`: values added beside a failure, for example `[firewall default action: Deny]` or `[...: not set]`.
 - `note`: appended to `count_where_*` failures (`1 found, 0 allowed: data disks that are not managed disks`).
-- `evidence_source`: `arg` (default), `join`, or `deep`. A target whose leaves are all `deep` needs per-resource ARM calls that are not collected; it is listed as a coverage gap instead of being evaluated.
+- `evidence_source`: `arg` (default), `join`, or `deep`. Use `join` for leaves that read `join.*` (see [Joins](#joins)). A target whose leaves are all `deep` needs per-resource ARM calls that are not collected; it is listed as a coverage gap instead of being evaluated.
 
 `where` takes `field` and exactly one of `equals: value`, `empty: true|false`, or `matches: pattern` (ignores case).
 

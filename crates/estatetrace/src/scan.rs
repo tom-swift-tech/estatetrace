@@ -257,7 +257,7 @@ async fn evaluate_active_packs(state: &AppState, resources: &[ResourceObservatio
         classify(&input, &rules).environment
     };
     let kinds = builtin_resource_kinds();
-    let joins = JoinIndex::empty();
+    let joins = JoinIndex::build(&db::list_latest_resources(&state.pool).await?);
     // Every observation in one run carries the run's scan id.
     let scan_id = resources
         .first()

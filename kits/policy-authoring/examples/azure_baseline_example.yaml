@@ -5,7 +5,7 @@
 # Azure defaults applied when the property is not reported.
 #
 # Features shown: resource_kind targets, all_of, when_absent, context, filter, ordinal_gte,
-# count_where_eq, environments, lanes, not_evaluated and a deep-only target.
+# count_where_eq, environments, lanes, not_evaluated, a deep-only target and a subnet join.
 schema_version: 1
 id: EXAMPLE-AZURE-BASELINE
 name: Example Azure Baseline (fictional)
@@ -218,6 +218,22 @@ controls:
       - resource_kind: storage_account
         check: { field: deep.diagnosticSettings, operator: count_gte, value: 1, evidence_source: deep }
 
+  - id: BASE-NET-016
+    source: { document: "Example Cloud Baseline", revision: "1", clause: "2.3" }
+    owner: Network Engineering
+    severity: medium
+    judges: Whether the subnet each private endpoint sits in has a network security group. The subnet is joined from its virtual network; a subnet outside the visible scope is unknown.
+    fix: Associate a network security group with the private endpoint's subnet
+    targets:
+      - resource_kind: private_endpoint
+        check:
+          name: subnet network security group
+          field: join.subnet.properties.networkSecurityGroup.id
+          operator: exists
+          evidence_source: join
+          context:
+            - { label: subnet, field: join.subnet.name }
+
 example_cases:
   - control_id: BASE-NET-001
     name: forwarding off
@@ -321,4 +337,35 @@ example_cases:
   - control_id: BASE-GOV-014
     name: never evaluated per resource
     resource: { type: Microsoft.Web/sites }
+    expected: unknown
+  - control_id: BASE-NET-016
+    name: endpoint subnet has an NSG
+    resource:
+      type: Microsoft.Network/privateEndpoints
+      properties: { subnet: { id: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-net/providers/Microsoft.Network/virtualNetworks/vnet-hub/subnets/snet-pe } }
+      join:
+        subnet:
+          id: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-net/providers/Microsoft.Network/virtualNetworks/vnet-hub/subnets/snet-pe
+          name: snet-pe
+          vnetName: vnet-hub
+          properties: { addressPrefix: 10.0.1.0/24, networkSecurityGroup: { id: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-net/providers/Microsoft.Network/networkSecurityGroups/nsg-pe } }
+    expected: pass
+  - control_id: BASE-NET-016
+    name: endpoint subnet has no NSG
+    resource:
+      type: Microsoft.Network/privateEndpoints
+      properties: { subnet: { id: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-net/providers/Microsoft.Network/virtualNetworks/vnet-hub/subnets/snet-open } }
+      join:
+        subnet:
+          id: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-net/providers/Microsoft.Network/virtualNetworks/vnet-hub/subnets/snet-open
+          name: snet-open
+          vnetName: vnet-hub
+          properties: { addressPrefix: 10.0.2.0/24 }
+    expected: fail
+  - control_id: BASE-NET-016
+    name: endpoint subnet outside the visible scope
+    resource:
+      type: Microsoft.Network/privateEndpoints
+      properties: { subnet: { id: /subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-other/providers/Microsoft.Network/virtualNetworks/vnet-other/subnets/snet-x } }
+      join: { subnet: null }
     expected: unknown
