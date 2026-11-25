@@ -1,6 +1,6 @@
-use estatetrace_core::*;
-use estatetrace_policy::{evaluate_pack_on_resources, parse_pack_yaml};
 use chrono::Utc;
+use estatetrace_core::*;
+use estatetrace_policy::{builtin_resource_kinds, evaluate_pack, parse_pack_yaml, JoinIndex};
 use serde_json::json;
 
 #[test]
@@ -38,8 +38,16 @@ example_cases: []
         evidence_available: true,
         lifecycle_epoch: 1,
     };
-    let evals = evaluate_pack_on_resources(&pack.controls, &pack.revision, &[obs]);
+    let result = evaluate_pack(
+        &pack,
+        &[obs],
+        &|_| EnvironmentClass::Unknown,
+        builtin_resource_kinds(),
+        &JoinIndex::empty(),
+    );
+    let evals = result.evaluations;
     assert_eq!(evals.len(), 1);
     assert_eq!(evals[0].control_revision, "9");
     assert_eq!(evals[0].outcome, EvalOutcome::Fail);
+    assert_eq!(evals[0].evidence["clause_revision"], "9");
 }

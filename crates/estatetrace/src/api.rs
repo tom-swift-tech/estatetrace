@@ -16,7 +16,8 @@ use estatetrace_integrations::{
     ChatClient, ChatConfig, ServiceNowClient, ServiceNowConfig, ApprovedChatContext,
 };
 use estatetrace_policy::{
-    coverage_report, parse_pack_json, parse_pack_yaml, pilot_pack, run_example_cases,
+    builtin_resource_kinds, coverage_report, parse_pack_json, parse_pack_yaml, pilot_pack,
+    run_example_cases, validate_pack as lint_and_validate_pack,
     suggest_and_preview, PolicyPack,
 };
 use serde::Deserialize;
@@ -638,6 +639,32 @@ async fn compliance_summary(
         .await
         .unwrap_or(0);
 
+    // Coverage (AC-P1-8): controls of active packs that evaluate per resource, and the stored
+    // gaps (from the latest scan) of those packs only.
+    let active = db::active_policy_packs(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut controls_total = 0usize;
+    let mut controls_evaluated = 0usize;
+    let mut active_ids = std::collections::HashSet::new();
+    for p in &active {
+        if let Some(id) = p.get("id").and_then(|v| v.as_str()) {
+            active_ids.insert(id.to_string());
+        }
+        let content = p.get("content").cloned().unwrap_or_default();
+        if let Ok(pack) = serde_json::from_value::<PolicyPack>(content) {
+            let cov = coverage_report(&pack);
+            controls_total += cov.controls_total;
+            controls_evaluated += cov.controls_evaluated;
+        }
+    }
+    let coverage_gaps: Vec<CoverageGap> = db::list_coverage_gaps(&state.pool, None)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .filter(|g| active_ids.contains(&g.pack_id))
+        .collect();
+
     Ok(Json(json!({
         "passing": pass,
         "failing": fail,
@@ -649,6 +676,9 @@ async fn compliance_summary(
         "verified_corrected": verified,
         "freshness": now,
         "scope": db::tracked_subscription_ids(&state.pool).await.unwrap_or_default(),
+        "coverage_gaps": coverage_gaps,
+        "controls_evaluated": controls_evaluated,
+        "controls_total": controls_total,
     })))
 }
 
@@ -791,27 +821,50 @@ struct ImportPackReq {
     activate: bool,
 }
 
+/// 422 with the validation message (it names the failing control); nothing is saved.
+fn pack_rejected(e: anyhow::Error) -> axum::response::Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({ "ok": false, "activated": false, "error": e.to_string() })),
+    )
+        .into_response()
+}
+
 async fn import_pack(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<ImportPackReq>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<axum::response::Response, StatusCode> {
     require_mutation(&state, &headers)?;
-    let pack = if let Some(y) = &req.yaml {
-        parse_pack_yaml(y).map_err(|_| StatusCode::BAD_REQUEST)?
+    let parsed = if let Some(y) = &req.yaml {
+        parse_pack_yaml(y)
     } else if let Some(j) = &req.json {
-        parse_pack_json(j).map_err(|_| StatusCode::BAD_REQUEST)?
+        parse_pack_json(j)
     } else {
         return Err(StatusCode::BAD_REQUEST);
     };
-    let examples = run_example_cases(&pack).map_err(|_| StatusCode::BAD_REQUEST)?;
-    if examples.iter().any(|(_, ok, _)| !*ok) {
+    let pack = match parsed {
+        Ok(p) => p,
+        Err(e) => return Ok(pack_rejected(e)),
+    };
+    let kinds = builtin_resource_kinds();
+    let issues = match lint_and_validate_pack(&pack, kinds) {
+        Ok(i) => i,
+        Err(e) => return Ok(pack_rejected(e)),
+    };
+    let examples = match run_example_cases(&pack, kinds) {
+        Ok(x) => x,
+        Err(e) => return Ok(pack_rejected(e)),
+    };
+    if examples.iter().any(|x| !x.ok) {
         return Ok(Json(json!({
             "activated": false,
             "error": "example cases failed",
             "examples": examples,
+            "issues": issues,
             "coverage": coverage_report(&pack),
-        })));
+        }))
+        .into_response());
     }
     let content = serde_json::to_value(&pack).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     db::save_policy_pack(
@@ -837,10 +890,12 @@ async fn import_pack(
     Ok(Json(json!({
         "activated": req.activate,
         "examples": examples,
+        "issues": issues,
         "coverage": coverage_report(&pack),
         "id": pack.id,
         "revision": pack.revision,
-    })))
+    }))
+    .into_response())
 }
 
 async fn load_pilot(
@@ -866,7 +921,7 @@ async fn load_pilot(
         "id": pack.id,
         "revision": pack.revision,
         "coverage": coverage_report(&pack),
-        "examples": run_example_cases(&pack).unwrap_or_default(),
+        "examples": run_example_cases(&pack, builtin_resource_kinds()).unwrap_or_default(),
     })))
 }
 
@@ -874,18 +929,29 @@ async fn validate_pack(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<axum::response::Response, StatusCode> {
     require_mutation(&state, &headers)?;
-    let pack: PolicyPack = if body.get("yaml").is_some() {
-        parse_pack_yaml(body["yaml"].as_str().unwrap_or("")).map_err(|_| StatusCode::BAD_REQUEST)?
+    let parsed = if body.get("yaml").is_some() {
+        parse_pack_yaml(body["yaml"].as_str().unwrap_or(""))
     } else {
-        serde_json::from_value(body).map_err(|_| StatusCode::BAD_REQUEST)?
+        parse_pack_json(&body.to_string())
+    };
+    let pack: PolicyPack = match parsed {
+        Ok(p) => p,
+        Err(e) => return Ok(pack_rejected(e)),
+    };
+    let kinds = builtin_resource_kinds();
+    let issues = match lint_and_validate_pack(&pack, kinds) {
+        Ok(i) => i,
+        Err(e) => return Ok(pack_rejected(e)),
     };
     Ok(Json(json!({
         "ok": true,
+        "issues": issues,
         "coverage": coverage_report(&pack),
-        "examples": run_example_cases(&pack).unwrap_or_default(),
-    })))
+        "examples": run_example_cases(&pack, kinds).unwrap_or_default(),
+    }))
+    .into_response())
 }
 
 #[derive(Deserialize)]

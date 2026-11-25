@@ -29,7 +29,7 @@ pub fn suggest_and_preview(
         .find(|c| c.id == control_id)
         .ok_or_else(|| format!("control {control_id} not found"))?;
 
-    if control.manual {
+    if control.effective_not_evaluated().is_some() {
         return Ok(ExportPreview {
             control_id: control.id.clone(),
             control_revision: control.source.revision.clone(),
@@ -89,8 +89,15 @@ fn build_export(
     target_scope: &str,
 ) -> (String, bool, String, Vec<String>, String, Value) {
     match rem.effect.as_str() {
-        "modify" if control.check.field.starts_with("tags.") => {
-            let tag_name = control.check.field.trim_start_matches("tags.");
+        "modify"
+            if control
+                .primary_field()
+                .is_some_and(|f| f.starts_with("tags.")) =>
+        {
+            let tag_name = control
+                .primary_field()
+                .unwrap_or_default()
+                .trim_start_matches("tags.");
             let inherit = rem.inherit_from.clone().unwrap_or_else(|| "resource_group".into());
             let bicep = render_modify_tag_bicep(control, tag_name, &inherit, target_scope);
             let mapping = json!({

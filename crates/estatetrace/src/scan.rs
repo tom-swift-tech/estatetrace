@@ -1,9 +1,11 @@
 use crate::state::AppState;
 use anyhow::Result;
 use estatetrace_azure::{diff_observations, Collector};
-use estatetrace_core::{ChangeLabel, DecisionKind, ResourceId, ResourceObservation};
+use estatetrace_core::{classify_resource, ChangeLabel, DecisionKind, ResourceId, ResourceObservation};
 use estatetrace_db as db;
-use estatetrace_policy::{evaluate_pack_on_resources, parse_pack_json, PolicyPack};
+use estatetrace_policy::{
+    builtin_resource_kinds, evaluate_pack, parse_pack_json, JoinIndex, PolicyPack,
+};
 use std::collections::HashSet;
 use tracing::{info, warn};
 
@@ -207,24 +209,46 @@ async fn scan_subscription_paged(
     Ok(all_new)
 }
 
+/// Evaluate every active pack (spec §3.1 `evaluate_pack`): kind-targeted controls, environment
+/// applicability from the classification rules, and coverage gaps for controls that cannot be
+/// judged per resource. Until the findings store lands (P3) results still go to `evaluations`.
 async fn evaluate_active_packs(state: &AppState, resources: &[ResourceObservation]) -> Result<()> {
     let packs = db::active_policy_packs(&state.pool).await?;
+    let rules = db::list_classification_rules(&state.pool).await?;
+    let env_of = |obs: &ResourceObservation| classify_resource(obs, &rules).environment;
+    let kinds = builtin_resource_kinds();
+    let joins = JoinIndex::empty();
+    // Every observation in one run carries the run's scan id.
+    let scan_id = resources
+        .first()
+        .map(|o| o.scan_id.clone())
+        .unwrap_or_default();
     for p in packs {
         let content = p.get("content").cloned().unwrap_or_default();
+        let pack_id = p
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
         let revision = p
             .get("revision")
             .and_then(|v| v.as_str())
             .unwrap_or("1")
             .to_string();
-        let pack: PolicyPack = if content.is_object() {
+        let mut pack: PolicyPack = if content.is_object() {
             serde_json::from_value(content)?
         } else {
             parse_pack_json(&content.to_string())?
         };
-        let evals = evaluate_pack_on_resources(&pack.controls, &revision, resources);
-        for ev in evals {
-            db::insert_evaluation(&state.pool, &ev).await?;
+        // The stored row's revision is authoritative for AC-03.
+        pack.revision = revision.clone();
+        let result = evaluate_pack(&pack, resources, &env_of, kinds, &joins);
+        for ev in &result.evaluations {
+            db::insert_evaluation(&state.pool, ev).await?;
         }
+        let pack_id = if pack_id.is_empty() { pack.id.clone() } else { pack_id };
+        db::replace_coverage_gaps(&state.pool, &pack_id, &revision, &scan_id, &result.coverage_gaps)
+            .await?;
     }
     Ok(())
 }

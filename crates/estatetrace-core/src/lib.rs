@@ -1,6 +1,7 @@
 //! Shared domain models for EstateTrace.
 
 pub mod classification;
+pub mod coverage;
 pub mod findings;
 pub mod ids;
 pub mod observations;
@@ -14,6 +15,7 @@ mod scope_tests;
 mod classification_tests;
 
 pub use classification::*;
+pub use coverage::*;
 pub use findings::*;
 pub use ids::*;
 pub use observations::*;

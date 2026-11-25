@@ -33,7 +33,7 @@ pub async fn open_db(path: &Path) -> Result<SqlitePool> {
 /// Versioned migrations applied after `001_init.sql`, in ascending order.
 /// Each runs once, inside a transaction, when `meta.schema_version` is below its number.
 /// Add new entries at the end; never edit or renumber an entry that has shipped.
-pub const MIGRATIONS: &[(i64, &str)] = &[];
+pub const MIGRATIONS: &[(i64, &str)] = &[(2, include_str!("../migrations/002_coverage_gaps.sql"))];
 
 pub async fn migrate(pool: &SqlitePool) -> Result<()> {
     // 001 is idempotent (CREATE ... IF NOT EXISTS) and runs on every open.
