@@ -47,6 +47,8 @@ pub fn router(state: AppState) -> Router {
         .route("/exceptions", get(list_exceptions_api).post(create_exception))
         .route("/dispositions", get(list_dispositions_api).post(create_disposition))
         .route("/classification/rules", get(list_class_rules).post(save_class_rule))
+        .route("/classification/suggested-rules", get(suggested_class_rules))
+        .route("/classification/quality", get(classification_quality))
         .route("/packs", get(list_packs).post(import_pack))
         .route("/packs/pilot", post(load_pilot))
         .route("/packs/validate", post(validate_pack))
@@ -361,16 +363,14 @@ async fn list_resources(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     resources.retain(|r| tracked.iter().any(|t| t == r.subscription_id.as_str()));
-    let rules = db::list_classification_rules(&state.pool)
-        .await
-        .unwrap_or_default();
+    let ctx = ClassCtx::load(&state).await;
     let rows: Vec<Value> = resources
         .iter()
         .map(|r| {
-            let class = classify_resource(r, &rules);
             json!({
                 "resource": r,
-                "classification": class,
+                "classification": ctx.classify(r),
+                "ownership": ctx.ownership(r),
             })
         })
         .collect();
@@ -453,6 +453,12 @@ struct InboxQuery {
     environment: Option<String>,
     severity: Option<String>,
     subscription_id: Option<String>,
+    /// P4: matches derived application (or application ID), case-insensitive.
+    application: Option<String>,
+    /// P4: matches derived owner, case-insensitive.
+    owner: Option<String>,
+    /// P4: `owner` | `application` | `subscription`.
+    group_by: Option<String>,
 }
 
 async fn inbox(
@@ -467,9 +473,7 @@ async fn inbox(
     let changes = db::list_recent_changes(&state.pool, 500)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let rules = db::list_classification_rules(&state.pool)
-        .await
-        .unwrap_or_default();
+    let ctx = ClassCtx::load(&state).await;
     let evals = db::list_evaluations(&state.pool, 1000)
         .await
         .unwrap_or_default();
@@ -501,19 +505,19 @@ async fn inbox(
             .flatten();
         let class = obs
             .as_ref()
-            .map(|o| classify_resource(o, &rules))
-            .unwrap_or(ClassificationResult {
-                environment: EnvironmentClass::Unknown,
-                winning_rule_id: None,
-                conflicting: false,
-                missing_tag: true,
-                reason: "no observation".into(),
-            });
+            .map(|o| ctx.classify(o))
+            .unwrap_or_else(|| ClassificationResult::unclassified("no observation", true));
         if let Some(ref env) = q.environment {
             if class.environment.as_str() != env {
                 continue;
             }
         }
+        let ownership = obs.as_ref().map(|o| ctx.ownership(o)).unwrap_or_default();
+        if !ownership_filter_ok(&ownership, q.application.as_deref(), q.owner.as_deref()) {
+            continue;
+        }
+        let group_key =
+            inbox_group_key(q.group_by.as_deref(), &ownership, &ctx, ch.subscription_id.as_str());
         let resource_evals: Vec<_> = evals
             .iter()
             .filter(|e| e.resource_id == ch.resource_id)
@@ -548,6 +552,8 @@ async fn inbox(
             "triage": triage,
             "disposition": disposition,
             "resource": obs,
+            "ownership": ownership,
+            "group_key": group_key,
             "since_last_visit": since_last_visit,
         }));
     }
@@ -582,10 +588,13 @@ async fn inbox(
         bt.cmp(at)
     });
 
+    let groups = group_inbox_rows(&mut rows, q.group_by.as_deref());
+
     let _ = db::meta_set(&state.pool, "last_visit", &now.to_rfc3339()).await;
 
     Ok(Json(json!({
         "rows": rows,
+        "groups": groups,
         "last_visit": last_visit,
         "filter": q,
     })))
@@ -764,12 +773,236 @@ async fn save_class_rule(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(rule): Json<ClassificationRule>,
-) -> Result<Json<Value>, StatusCode> {
-    require_mutation(&state, &headers)?;
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    require_mutation(&state, &headers).map_err(status_json)?;
+    // Invariant 16: every rule regex compiles at save time.
+    validate_rule(&rule).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))))?;
     db::upsert_classification_rule(&state.pool, &rule)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| status_json(StatusCode::INTERNAL_SERVER_ERROR))?;
     Ok(Json(json!({ "ok": true })))
+}
+
+fn status_json(s: StatusCode) -> (StatusCode, Json<Value>) {
+    (s, Json(json!({ "error": s.canonical_reason().unwrap_or("error") })))
+}
+
+/// Default rules for the operator to review and save. Never saved automatically.
+async fn suggested_class_rules(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
+    Ok(Json(json!({ "rules": suggested_rules() })))
+}
+
+/// Data quality: counts by classification source over tracked resources, plus tracked
+/// subscriptions whose name gives no environment (ports of azcompliance `run_fact` kinds
+/// `environment_source` and `no_environment_token`).
+async fn classification_quality(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
+    let tracked = db::tracked_subscription_ids(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut resources = db::list_latest_resources(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    resources.retain(|r| tracked.iter().any(|t| t == r.subscription_id.as_str()));
+    let ctx = ClassCtx::load(&state).await;
+
+    let mut by_source: std::collections::BTreeMap<&'static str, u64> = Default::default();
+    let mut by_environment: std::collections::BTreeMap<&'static str, u64> = Default::default();
+    let (mut conflicting, mut missing_tag) = (0u64, 0u64);
+    for r in &resources {
+        let c = ctx.classify(r);
+        *by_source.entry(c.source.as_str()).or_default() += 1;
+        *by_environment.entry(c.environment.as_str()).or_default() += 1;
+        conflicting += c.conflicting as u64;
+        missing_tag += c.missing_tag as u64;
+    }
+
+    // Subscription-name check uses the saved name patterns, or the suggested ones when none
+    // are saved. A subscription pinned by an explicit `subscription` rule is not reported.
+    let saved_name_rules: Vec<ClassificationRule> = ctx
+        .rules
+        .iter()
+        .filter(|r| r.kind == ClassificationRuleKind::SubscriptionNamePattern)
+        .cloned()
+        .collect();
+    let (name_rules, name_rules_source) = if saved_name_rules.is_empty() {
+        let suggested: Vec<ClassificationRule> = suggested_rules()
+            .into_iter()
+            .filter(|r| r.kind == ClassificationRuleKind::SubscriptionNamePattern)
+            .collect();
+        (suggested, "suggested")
+    } else {
+        (saved_name_rules, "saved")
+    };
+    let pinned: std::collections::HashSet<&str> = ctx
+        .rules
+        .iter()
+        .filter(|r| r.kind == ClassificationRuleKind::Subscription)
+        .filter_map(|r| r.subscription_id.as_ref().map(|s| s.as_str()))
+        .collect();
+    let subs = db::list_subscriptions(&state.pool).await.unwrap_or_default();
+    let no_token: Vec<Value> = subs
+        .iter()
+        .filter(|s| tracked.iter().any(|t| t == s.id.as_str()))
+        .filter(|s| !pinned.contains(s.id.as_str()))
+        .filter(|s| subscription_name_environment(&s.name, &name_rules).is_none())
+        .map(|s| json!({ "id": s.id, "name": s.name }))
+        .collect();
+
+    Ok(Json(json!({
+        "total": resources.len(),
+        "by_source": by_source,
+        "by_environment": by_environment,
+        "conflicting": conflicting,
+        "missing_tag": missing_tag,
+        "subscriptions_without_environment_token": no_token,
+        "name_rules": name_rules_source,
+    })))
+}
+
+/// Classification inputs loaded once per request: rules, subscription names, RG tags and
+/// the ownership config. Ownership is derived at read time, so a config change needs no rescan.
+struct ClassCtx {
+    rules: Vec<ClassificationRule>,
+    sub_names: std::collections::HashMap<String, String>,
+    rg_tags: std::collections::HashMap<(String, String), Value>,
+    ownership: OwnershipConfig,
+}
+
+impl ClassCtx {
+    async fn load(state: &AppState) -> Self {
+        let rules = db::list_classification_rules(&state.pool)
+            .await
+            .unwrap_or_default();
+        let sub_names = db::list_subscriptions(&state.pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.id.as_str().to_string(), s.name))
+            .collect();
+        let rg_tags = db::get_resource_group_tags(&state.pool, None)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                let key = (
+                    r.subscription_id.as_str().to_string(),
+                    r.resource_group.to_lowercase(),
+                );
+                (key, r.tags)
+            })
+            .collect();
+        let ownership = state
+            .settings
+            .read()
+            .await
+            .ownership
+            .clone()
+            .unwrap_or_default();
+        Self {
+            rules,
+            sub_names,
+            rg_tags,
+            ownership,
+        }
+    }
+
+    fn input<'a>(&'a self, obs: &'a ResourceObservation) -> ClassifyInput<'a> {
+        ClassifyInput {
+            obs,
+            subscription_name: self
+                .sub_names
+                .get(obs.subscription_id.as_str())
+                .map(|s| s.as_str()),
+            rg_tags: obs.resource_group.as_ref().and_then(|rg| {
+                self.rg_tags
+                    .get(&(obs.subscription_id.as_str().to_string(), rg.to_lowercase()))
+            }),
+        }
+    }
+
+    fn classify(&self, obs: &ResourceObservation) -> ClassificationResult {
+        classify(&self.input(obs), &self.rules)
+    }
+
+    fn ownership(&self, obs: &ResourceObservation) -> Ownership {
+        derive_ownership(&self.input(obs), &self.ownership)
+    }
+}
+
+fn eq_filter(value: Option<&str>, want: Option<&str>) -> bool {
+    match want.map(str::trim).filter(|w| !w.is_empty()) {
+        None => true,
+        Some(w) => value.is_some_and(|v| v.trim().eq_ignore_ascii_case(w)),
+    }
+}
+
+/// AC-P4-6: inbox `application` / `owner` filters read the derived ownership.
+fn ownership_filter_ok(o: &Ownership, application: Option<&str>, owner: Option<&str>) -> bool {
+    (eq_filter(o.application.as_deref(), application)
+        || eq_filter(o.application_id.as_deref(), application))
+        && eq_filter(o.owner.as_deref(), owner)
+}
+
+fn inbox_group_key(
+    group_by: Option<&str>,
+    o: &Ownership,
+    ctx: &ClassCtx,
+    subscription_id: &str,
+) -> Option<String> {
+    match group_by? {
+        "owner" => o.owner.clone(),
+        "application" => o.application.clone().or_else(|| o.application_id.clone()),
+        "subscription" => Some(
+            ctx.sub_names
+                .get(subscription_id)
+                .cloned()
+                .unwrap_or_else(|| subscription_id.to_string()),
+        ),
+        _ => None,
+    }
+}
+
+/// Stable-sort rows by `group_key` (unassigned last), keeping the triage order within a
+/// group, and return `[{key, count}]` in display order. No-op without a recognised `group_by`.
+fn group_inbox_rows(rows: &mut [Value], group_by: Option<&str>) -> Vec<Value> {
+    if !matches!(group_by, Some("owner" | "application" | "subscription")) {
+        return Vec::new();
+    }
+    let key = |r: &Value| {
+        r.get("group_key")
+            .and_then(|v| v.as_str())
+            .map(str::to_lowercase)
+    };
+    rows.sort_by(|a, b| match (key(a), key(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    let mut groups: Vec<(Option<String>, Option<String>, u64)> = Vec::new();
+    for r in rows.iter() {
+        let display = r
+            .get("group_key")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let k = key(r);
+        match groups.last_mut() {
+            Some((last, _, n)) if *last == k => *n += 1,
+            _ => groups.push((k, display, 1)),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(_, display, n)| json!({ "key": display, "count": n }))
+        .collect()
 }
 
 async fn list_packs(
@@ -1059,12 +1292,16 @@ async fn update_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(settings): Json<SettingsDoc>,
-) -> Result<Json<Value>, StatusCode> {
-    require_mutation(&state, &headers)?;
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    require_mutation(&state, &headers).map_err(status_json)?;
+    if let Some(o) = &settings.ownership {
+        validate_ownership_config(o)
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))))?;
+    }
     *state.settings.write().await = settings;
     save_settings(&state)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| status_json(StatusCode::INTERNAL_SERVER_ERROR))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1843,5 +2080,311 @@ mod auth_tests {
         assert!(is_loopback_origin("http://127.0.0.1:8787"));
         assert!(is_loopback_origin("http://localhost"));
         assert!(is_loopback_origin("http://[::1]"));
+    }
+}
+
+/// Phase 4 API tests (AC-P4-6 and rule handlers). Fictional names only.
+#[cfg(test)]
+mod classification_api_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    async fn seeded() -> (axum::Router, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = AppState::bootstrap_in(dir.path().to_path_buf())
+            .await
+            .expect("bootstrap");
+        let _kept = dir.keep();
+        let pool = &state.pool;
+        db::upsert_tenant(
+            pool,
+            &TenantInfo {
+                id: TenantId::new("tenant-contoso"),
+                name: "Contoso".into(),
+                needs_sign_in: false,
+                last_refresh: Some(Utc::now()),
+                access_issue: None,
+            },
+        )
+        .await
+        .unwrap();
+        for (id, name) in [
+            ("sub-contoso-prod", "Contoso-Prod-01"),
+            ("sub-contoso-shared", "Products-Shared"),
+        ] {
+            db::upsert_subscription(
+                pool,
+                &SubscriptionInfo {
+                    id: SubscriptionId::new(id),
+                    tenant_id: TenantId::new("tenant-contoso"),
+                    name: name.into(),
+                    state: "Enabled".into(),
+                    quota_id: None,
+                    tags: json!({}),
+                    access_issue: None,
+                    last_refresh: Some(Utc::now()),
+                },
+            )
+            .await
+            .unwrap();
+            db::insert_scope_decision(
+                pool,
+                &ScopeDecision {
+                    id: format!("track-{id}"),
+                    provider: Provider::Azure,
+                    tenant_id: TenantId::new("tenant-contoso"),
+                    subscription_id: Some(SubscriptionId::new(id)),
+                    decision: DecisionKind::Track,
+                    source: DecisionSource::Explicit,
+                    matching_rule_id: None,
+                    reason: None,
+                    effective_from: Utc::now(),
+                    effective_to: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let resources = [
+            ("web-payments", "rg-pay", json!({ "app-name": "Payments", "owner": "team-a" })),
+            ("web-ledger", "rg-ledger", json!({ "app-name": "undefined" })),
+        ];
+        for (name, rg, tags) in resources {
+            let rid = format!(
+                "/subscriptions/sub-contoso-prod/resourceGroups/{rg}/providers/Microsoft.Web/sites/{name}"
+            );
+            db::insert_observation(
+                pool,
+                &ResourceObservation {
+                    id: format!("obs-{name}"),
+                    provider: Provider::Azure,
+                    resource_id: ResourceId::new(rid.clone()),
+                    tenant_id: TenantId::new("tenant-contoso"),
+                    subscription_id: SubscriptionId::new("sub-contoso-prod"),
+                    resource_type: "Microsoft.Web/sites".into(),
+                    name: name.into(),
+                    location: Some("eastus".into()),
+                    resource_group: Some(rg.into()),
+                    tags,
+                    properties: json!({}),
+                    scan_id: "scan-1".into(),
+                    observation_time: Utc::now(),
+                    evidence_available: true,
+                    lifecycle_epoch: 1,
+                },
+            )
+            .await
+            .unwrap();
+            db::insert_change_event(
+                pool,
+                &ChangeEvent {
+                    id: format!("chg-{name}"),
+                    resource_id: ResourceId::new(rid),
+                    subscription_id: SubscriptionId::new("sub-contoso-prod"),
+                    source_event_id: Some(format!("test:{name}")),
+                    label: ChangeLabel::Updated,
+                    times: DualTime::observed_now(),
+                    before: None,
+                    after: None,
+                    property_diffs: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // RG name stored in different case than the observation: lookup is case-insensitive.
+        db::upsert_resource_group_tags(
+            pool,
+            &[ResourceGroupTags {
+                subscription_id: SubscriptionId::new("sub-contoso-prod"),
+                resource_group: "RG-Ledger".into(),
+                tags: json!({ "App-Name": "Ledger", "Owner": "team-b", "Environment": "prod" }),
+                observed_at: Utc::now(),
+            }],
+        )
+        .await
+        .unwrap();
+        state.settings.write().await.ownership = Some(OwnershipConfig {
+            application_tag: Some("app-name".into()),
+            owner_tag: Some("owner".into()),
+            ..Default::default()
+        });
+        let token = state.session_token.clone();
+        (router(state), token)
+    }
+
+    async fn get_json(app: &axum::Router, token: &str, uri: &str) -> Value {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("x-session-token", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn post(app: &axum::Router, token: &str, uri: &str, body: Value) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("x-session-token", token)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    fn names(v: &Value) -> Vec<String> {
+        v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["resource"]["name"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ac_p4_6_inbox_application_owner_filters_and_group_by_use_derive_ownership() {
+        let (app, token) = seeded().await;
+
+        let all = get_json(&app, &token, "/api/inbox").await;
+        assert_eq!(all["rows"].as_array().unwrap().len(), 2);
+
+        // web-ledger's own app tag is `undefined`; the RG tag supplies the application.
+        let ledger = get_json(&app, &token, "/api/inbox?application=ledger").await;
+        assert_eq!(names(&ledger), vec!["web-ledger"]);
+        assert_eq!(ledger["rows"][0]["ownership"]["application"], "Ledger");
+        assert_eq!(ledger["rows"][0]["ownership"]["from_resource_group"], true);
+
+        let team_a = get_json(&app, &token, "/api/inbox?owner=TEAM-A").await;
+        assert_eq!(names(&team_a), vec!["web-payments"]);
+        let team_b = get_json(&app, &token, "/api/inbox?owner=team-b&application=Ledger").await;
+        assert_eq!(names(&team_b), vec!["web-ledger"]);
+        let none = get_json(&app, &token, "/api/inbox?owner=team-c").await;
+        assert!(none["rows"].as_array().unwrap().is_empty());
+
+        let by_owner = get_json(&app, &token, "/api/inbox?group_by=owner").await;
+        assert_eq!(names(&by_owner), vec!["web-payments", "web-ledger"]);
+        assert_eq!(
+            by_owner["groups"],
+            json!([{ "key": "team-a", "count": 1 }, { "key": "team-b", "count": 1 }])
+        );
+        assert_eq!(by_owner["rows"][1]["group_key"], "team-b");
+
+        let by_app = get_json(&app, &token, "/api/inbox?group_by=application").await;
+        assert_eq!(names(&by_app), vec!["web-ledger", "web-payments"]);
+        assert_eq!(by_app["groups"][0]["key"], "Ledger");
+    }
+
+    #[tokio::test]
+    async fn rule_save_validates_regex_and_suggested_rules_are_not_saved() {
+        let (app, token) = seeded().await;
+
+        let suggested = get_json(&app, &token, "/api/classification/suggested-rules").await;
+        assert!(suggested["rules"].as_array().unwrap().len() >= 5);
+        let saved = get_json(&app, &token, "/api/classification/rules").await;
+        assert!(
+            saved["rules"].as_array().unwrap().is_empty(),
+            "suggested rules are never auto-saved"
+        );
+
+        let bad = json!({
+            "id": "bad", "kind": "subscription_name_pattern", "subscription_id": null,
+            "resource_group": null, "tag_key": null, "tag_value": null,
+            "environment": "prod", "priority": 10, "pattern": "(?<!non)prod"
+        });
+        assert_eq!(
+            post(&app, &token, "/api/classification/rules", bad).await,
+            StatusCode::BAD_REQUEST
+        );
+
+        let good = json!({
+            "id": "subname-prod", "kind": "subscription_name_pattern", "subscription_id": null,
+            "resource_group": null, "tag_key": null, "tag_value": null,
+            "environment": "prod", "priority": 490,
+            "pattern": "(?i)(^|[^a-z0-9])prod(uction)?([^a-z0-9]|$)"
+        });
+        assert_eq!(
+            post(&app, &token, "/api/classification/rules", good).await,
+            StatusCode::OK
+        );
+        let seg = json!({
+            "id": "svc-seg", "kind": "tag_segment", "subscription_id": null,
+            "resource_group": null, "tag_key": "svc", "tag_value": null,
+            "environment": "unknown", "priority": 300,
+            "segment_map": { "dev": "dev", "prod": "prod" }
+        });
+        assert_eq!(
+            post(&app, &token, "/api/classification/rules", seg).await,
+            StatusCode::OK
+        );
+        let saved = get_json(&app, &token, "/api/classification/rules").await;
+        let rules = saved["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 2);
+        let seg_rule = rules.iter().find(|r| r["id"] == "svc-seg").unwrap();
+        assert_eq!(seg_rule["kind"], "tag_segment");
+        assert_eq!(seg_rule["segment_map"]["dev"], "dev");
+        let name_rule = rules.iter().find(|r| r["id"] == "subname-prod").unwrap();
+        assert_eq!(name_rule["pattern"], "(?i)(^|[^a-z0-9])prod(uction)?([^a-z0-9]|$)");
+
+        // Resources in Contoso-Prod-01 are now Prod by subscription name.
+        let res = get_json(&app, &token, "/api/resources").await;
+        for r in res["resources"].as_array().unwrap() {
+            assert_eq!(r["classification"]["environment"], "prod");
+            assert_eq!(r["classification"]["source"], "subscription_name");
+        }
+
+        // Ownership config with a bad rollup regex is rejected.
+        let bad_settings = json!({
+            "scan_interval_minutes": 60, "operations_timezone": null, "chat_history_enabled": false,
+            "retention": {}, "production_mappings": {}, "servicenow": null, "chat": null,
+            "theme_path": null, "ownership": { "lob_rollup_pattern": "(" }
+        });
+        assert_eq!(
+            post(&app, &token, "/api/settings", bad_settings).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn classification_quality_counts_sources_and_tokenless_subscriptions() {
+        let (app, token) = seeded().await;
+        let rg_rule = json!({
+            "id": "rgtag-env", "kind": "resource_group_tag", "subscription_id": null,
+            "resource_group": null, "tag_key": "Environment", "tag_value": null,
+            "environment": "unknown", "priority": 270
+        });
+        assert_eq!(
+            post(&app, &token, "/api/classification/rules", rg_rule).await,
+            StatusCode::OK
+        );
+
+        let q = get_json(&app, &token, "/api/classification/quality").await;
+        assert_eq!(q["total"], 2);
+        assert_eq!(q["by_source"]["resource_group_tag"], 1);
+        assert_eq!(q["by_source"]["none"], 1);
+        assert_eq!(q["name_rules"], "suggested");
+        let tokenless: Vec<&str> = q["subscriptions_without_environment_token"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(tokenless, vec!["Products-Shared"]);
     }
 }

@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, InboxResponse, InboxRow } from "../api";
+import { api, InboxGroup, InboxResponse, InboxRow } from "../api";
 
 interface SubscriptionOption {
   subscription: {
@@ -23,6 +23,10 @@ export default function Inbox() {
   const [rows, setRows] = useState<InboxRow[]>([]);
   const [env, setEnv] = useState("prod");
   const [severity, setSeverity] = useState("");
+  const [application, setApplication] = useState("");
+  const [owner, setOwner] = useState("");
+  const [groupBy, setGroupBy] = useState("");
+  const [groups, setGroups] = useState<InboxGroup[]>([]);
   const [subscriptionId, setSubscriptionId] = useState(
     () => localStorage.getItem("estatetrace.subscription_id") || "",
   );
@@ -74,9 +78,13 @@ export default function Inbox() {
       if (subscriptionId.trim()) {
         params.set("subscription_id", subscriptionId.trim());
       }
+      if (application.trim()) params.set("application", application.trim());
+      if (owner.trim()) params.set("owner", owner.trim());
+      if (groupBy) params.set("group_by", groupBy);
       const q = params.toString() ? `?${params}` : "";
       const data = await api<InboxResponse>(`/inbox${q}`);
       setRows(data.rows || []);
+      setGroups(data.groups || []);
       setLastVisit(data.last_visit ?? null);
       setError("");
     } catch (e: unknown) {
@@ -98,7 +106,7 @@ export default function Inbox() {
 
   useEffect(() => {
     load();
-  }, [env, severity, subscriptionId]);
+  }, [env, severity, subscriptionId, groupBy]);
 
   const sinceCount = rows.filter((r) => r.since_last_visit).length;
 
@@ -202,6 +210,35 @@ export default function Inbox() {
               ))}
           </select>
         </label>
+        <label>
+          Application
+          <input
+            value={application}
+            placeholder="any"
+            onChange={(e) => setApplication(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && load()}
+            onBlur={load}
+          />
+        </label>
+        <label>
+          Owner
+          <input
+            value={owner}
+            placeholder="any"
+            onChange={(e) => setOwner(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && load()}
+            onBlur={load}
+          />
+        </label>
+        <label>
+          Group by
+          <select value={groupBy} onChange={(e) => setGroupBy(e.target.value)}>
+            <option value="">None</option>
+            <option value="subscription">Subscription</option>
+            <option value="owner">Owner</option>
+            <option value="application">Application</option>
+          </select>
+        </label>
         <button
           className="secondary"
           onClick={refreshSubscriptions}
@@ -245,8 +282,22 @@ export default function Inbox() {
           </tr>
         </thead>
         <tbody>
-          {rows.map((r) => (
-            <tr key={r.change?.id}>
+          {rows.map((r, i) => (
+            <Fragment key={r.change?.id ?? i}>
+            {groupBy &&
+              (i === 0 || rows[i - 1].group_key !== r.group_key) && (
+                <tr className="group-header">
+                  <td colSpan={5}>
+                    <strong>{r.group_key || `No ${groupBy}`}</strong>{" "}
+                    <span className="muted">
+                      {groups.find((g) => (g.key ?? null) === (r.group_key ?? null))
+                        ?.count ?? ""}{" "}
+                      row(s)
+                    </span>
+                  </td>
+                </tr>
+              )}
+            <tr>
               <td>
                 <div>{r.change?.times?.observation_time}</div>
                 <div className="muted">
@@ -272,6 +323,24 @@ export default function Inbox() {
                   {r.classification?.environment}
                 </span>
                 <div className="muted">{r.classification?.reason}</div>
+                {r.classification?.conflicting && (
+                  <span className="badge unknown" title="Matching rules disagree; the highest priority wins">
+                    Conflicting rules
+                  </span>
+                )}
+                {r.classification?.missing_tag && (
+                  <span className="badge unknown" title="Resource has no Environment tag">
+                    Missing env tag
+                  </span>
+                )}
+                {(r.ownership?.application || r.ownership?.owner) && (
+                  <div className="muted">
+                    {[r.ownership?.application, r.ownership?.owner]
+                      .filter(Boolean)
+                      .join(" · ")}
+                    {r.ownership?.from_resource_group ? " (from resource group)" : ""}
+                  </div>
+                )}
               </td>
               <td>
                 {r.triage ? (
@@ -298,6 +367,7 @@ export default function Inbox() {
                 )}
               </td>
             </tr>
+            </Fragment>
           ))}
           {!rows.length && (
             <tr>
