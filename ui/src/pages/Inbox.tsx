@@ -26,6 +26,8 @@ export default function Inbox() {
   const [application, setApplication] = useState("");
   const [owner, setOwner] = useState("");
   const [groupBy, setGroupBy] = useState("");
+  // Security-first default (AC-P6-1): hygiene findings only when asked for.
+  const [includeHygiene, setIncludeHygiene] = useState(false);
   const [groups, setGroups] = useState<InboxGroup[]>([]);
   const [subscriptionId, setSubscriptionId] = useState(
     () => localStorage.getItem("estatetrace.subscription_id") || "",
@@ -82,6 +84,7 @@ export default function Inbox() {
       if (application.trim()) params.set("application", application.trim());
       if (owner.trim()) params.set("owner", owner.trim());
       if (groupBy) params.set("group_by", groupBy);
+      params.set("lane", includeHygiene ? "all" : "security");
       const q = params.toString() ? `?${params}` : "";
       const data = await api<InboxResponse>(`/inbox${q}`);
       setRows(data.rows || []);
@@ -108,7 +111,7 @@ export default function Inbox() {
 
   useEffect(() => {
     load();
-  }, [env, severity, subscriptionId, groupBy]);
+  }, [env, severity, subscriptionId, groupBy, includeHygiene]);
 
   const sinceCount = rows.filter((r) => r.since_last_visit).length;
 
@@ -240,6 +243,18 @@ export default function Inbox() {
             <option value="owner">Owner</option>
             <option value="application">Application</option>
           </select>
+        </label>
+        <label
+          title="Tag and metadata hygiene findings are hidden by default so security findings lead."
+          style={{ display: "flex", alignItems: "center", gap: "0.35rem" }}
+        >
+          <input
+            type="checkbox"
+            style={{ width: "auto" }}
+            checked={includeHygiene}
+            onChange={(e) => setIncludeHygiene(e.target.checked)}
+          />
+          Include hygiene findings
         </label>
         <button
           className="secondary"
