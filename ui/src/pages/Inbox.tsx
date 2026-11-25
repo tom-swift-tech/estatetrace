@@ -168,6 +168,8 @@ export default function Inbox() {
           <select value={env} onChange={(e) => setEnv(e.target.value)}>
             <option value="prod">Prod</option>
             <option value="nonprod">Non-prod</option>
+            <option value="dev">Dev</option>
+            <option value="sandbox">Sandbox</option>
             <option value="">All</option>
           </select>
         </label>

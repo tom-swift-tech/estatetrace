@@ -4,8 +4,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentClass {
+    #[serde(alias = "Prod", alias = "production")]
     Prod,
+    #[serde(rename = "nonprod", alias = "non_prod", alias = "NonProd", alias = "non-prod")]
     NonProd,
+    #[serde(alias = "Dev", alias = "development")]
+    Dev,
+    #[serde(alias = "Sandbox", alias = "sbx")]
+    Sandbox,
+    #[serde(alias = "Unknown")]
     Unknown,
 }
 
@@ -14,7 +21,27 @@ impl EnvironmentClass {
         match self {
             EnvironmentClass::Prod => "prod",
             EnvironmentClass::NonProd => "nonprod",
+            EnvironmentClass::Dev => "dev",
+            EnvironmentClass::Sandbox => "sandbox",
             EnvironmentClass::Unknown => "unknown",
+        }
+    }
+
+    /// Case-insensitive parse of the canonical names and common aliases.
+    /// Spaces, hyphens and underscores are ignored ("Non-Prod" == "nonprod").
+    pub fn parse(s: &str) -> Option<Self> {
+        let key: String = s
+            .chars()
+            .filter(|c| !matches!(c, ' ' | '-' | '_'))
+            .collect::<String>()
+            .to_ascii_lowercase();
+        match key.as_str() {
+            "prod" | "production" => Some(Self::Prod),
+            "nonprod" | "nonproduction" => Some(Self::NonProd),
+            "dev" | "development" => Some(Self::Dev),
+            "sandbox" | "sbx" => Some(Self::Sandbox),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
         }
     }
 }

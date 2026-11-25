@@ -807,11 +807,7 @@ pub async fn list_classification_rules(pool: &SqlitePool) -> Result<Vec<Classifi
             resource_group: rg,
             tag_key: tk,
             tag_value: tv,
-            environment: match env.as_str() {
-                "prod" => EnvironmentClass::Prod,
-                "nonprod" => EnvironmentClass::NonProd,
-                _ => EnvironmentClass::Unknown,
-            },
+            environment: EnvironmentClass::parse(&env).unwrap_or(EnvironmentClass::Unknown),
             priority: pri as i32,
         })
         .collect())
