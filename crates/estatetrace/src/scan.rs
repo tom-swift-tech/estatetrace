@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use anyhow::Result;
 use estatetrace_azure::{diff_observations, Collector};
-use estatetrace_core::{classify_resource, ChangeLabel, DecisionKind, ResourceId, ResourceObservation};
+use estatetrace_core::{classify, ChangeLabel, ClassifyInput, DecisionKind, ResourceId, ResourceObservation};
 use estatetrace_db as db;
 use estatetrace_policy::{
     builtin_resource_kinds, evaluate_pack, parse_pack_json, JoinIndex, PolicyPack,
@@ -225,7 +225,37 @@ async fn scan_subscription_paged(
 async fn evaluate_active_packs(state: &AppState, resources: &[ResourceObservation]) -> Result<()> {
     let packs = db::active_policy_packs(&state.pool).await?;
     let rules = db::list_classification_rules(&state.pool).await?;
-    let env_of = |obs: &ResourceObservation| classify_resource(obs, &rules).environment;
+    // Full classification (subscription-name and resource-group-tag rules), not the
+    // resource-only wrapper, so evaluation environments match what the inbox shows.
+    let sub_names: std::collections::HashMap<String, String> = db::list_subscriptions(&state.pool)
+        .await?
+        .into_iter()
+        .map(|s| (s.id.as_str().to_ascii_lowercase(), s.name))
+        .collect();
+    let rg_tags: std::collections::HashMap<(String, String), serde_json::Value> =
+        db::get_resource_group_tags(&state.pool, None)
+            .await?
+            .into_iter()
+            .map(|r| {
+                (
+                    (
+                        r.subscription_id.as_str().to_ascii_lowercase(),
+                        r.resource_group.to_ascii_lowercase(),
+                    ),
+                    r.tags,
+                )
+            })
+            .collect();
+    let env_of = |obs: &ResourceObservation| {
+        let sub = obs.subscription_id.as_str().to_ascii_lowercase();
+        let rg = obs.resource_group.as_deref().map(|g| g.to_ascii_lowercase());
+        let input = ClassifyInput {
+            obs,
+            subscription_name: sub_names.get(&sub).map(String::as_str),
+            rg_tags: rg.and_then(|g| rg_tags.get(&(sub.clone(), g))),
+        };
+        classify(&input, &rules).environment
+    };
     let kinds = builtin_resource_kinds();
     let joins = JoinIndex::empty();
     // Every observation in one run carries the run's scan id.
