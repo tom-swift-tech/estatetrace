@@ -7,7 +7,8 @@ use estatetrace_core::{
 };
 use estatetrace_db as db;
 use estatetrace_policy::{
-    builtin_resource_kinds, evaluate_pack, parse_pack_json, JoinIndex, PolicyPack,
+    builtin_resource_kinds, evaluate_pack, in_tracked_subscriptions, parse_pack_json, JoinIndex,
+    PolicyPack,
 };
 use std::collections::HashSet;
 use tracing::{info, warn};
@@ -111,8 +112,18 @@ pub async fn run_scan_for(state: &AppState, subscription_ids: Option<&[String]>)
     }
 
     // A failed pack write rolls back that pack only; the scan is then partial (spec §7).
-    let eval_error = match evaluate_active_packs(state, &scan_id, &all_obs, &complete_subscriptions)
-        .await
+    let tracked_ids: Vec<String> = tracked
+        .iter()
+        .map(|r| r.subscription.id.as_str().to_string())
+        .collect();
+    let eval_error = match evaluate_active_packs(
+        state,
+        &scan_id,
+        &all_obs,
+        &complete_subscriptions,
+        &tracked_ids,
+    )
+    .await
     {
         Ok(()) => None,
         Err(e) => {
@@ -279,6 +290,7 @@ async fn evaluate_active_packs(
     scan_id: &str,
     resources: &[ResourceObservation],
     complete_subscriptions: &HashSet<SubscriptionId>,
+    tracked_subscription_ids: &[String],
 ) -> Result<()> {
     let packs = db::active_policy_packs(&state.pool).await?;
     let rules = db::list_classification_rules(&state.pool).await?;
@@ -314,8 +326,11 @@ async fn evaluate_active_packs(
         classify(&input, &rules).environment
     };
     let kinds = builtin_resource_kinds();
-    // Joins use only resources still present: a VNet marked missing must not supply subnets.
-    let joins = JoinIndex::build(&db::list_present_resources(&state.pool).await?);
+    // Joins use resources still present in a tracked subscription. A missing VNet, or a
+    // VNet in a subscription the operator excluded, must not supply subnets (AC-P5-2).
+    let present = db::list_present_resources(&state.pool).await?;
+    let visible = in_tracked_subscriptions(&present, tracked_subscription_ids);
+    let joins = JoinIndex::build(&visible);
     let mut failures: Vec<String> = Vec::new();
     for p in packs {
         let content = p.get("content").cloned().unwrap_or_default();
@@ -329,10 +344,17 @@ async fn evaluate_active_packs(
             .and_then(|v| v.as_str())
             .unwrap_or("1")
             .to_string();
-        let mut pack: PolicyPack = if content.is_object() {
-            serde_json::from_value(content)?
-        } else {
-            parse_pack_json(&content.to_string())?
+        let mut pack = match parse_stored_pack(&content) {
+            Ok(pack) => pack,
+            Err(e) => {
+                let label = if pack_id.is_empty() {
+                    format!("revision {revision}")
+                } else {
+                    pack_id
+                };
+                failures.push(format!("pack {label}: {e}"));
+                continue;
+            }
         };
         // The stored row's revision is authoritative for AC-03.
         pack.revision = revision.clone();
@@ -359,5 +381,61 @@ async fn evaluate_active_packs(
         Ok(())
     } else {
         anyhow::bail!(failures.join("; "))
+    }
+}
+
+fn parse_stored_pack(content: &serde_json::Value) -> Result<PolicyPack> {
+    if content.is_object() {
+        Ok(serde_json::from_value(content.clone())?)
+    } else {
+        parse_pack_json(&content.to_string())
+    }
+}
+
+#[cfg(test)]
+mod pack_eval_tests {
+    use super::*;
+    use crate::state::AppState;
+
+    #[tokio::test]
+    async fn a_bad_pack_does_not_skip_later_packs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = AppState::bootstrap_in(dir.path().to_path_buf())
+            .await
+            .expect("bootstrap");
+        let good = estatetrace_policy::pilot_pack();
+        db::save_policy_pack(
+            &state.pool,
+            &good.id,
+            &good.name,
+            &good.revision,
+            None,
+            None,
+            true,
+            &serde_json::to_value(&good).unwrap(),
+        )
+        .await
+        .unwrap();
+        db::save_policy_pack(
+            &state.pool,
+            "bad-pack",
+            "Bad",
+            "1",
+            None,
+            None,
+            true,
+            &serde_json::json!({ "schema_version": 1 }),
+        )
+        .await
+        .unwrap();
+        let err = evaluate_active_packs(&state, "scan-1", &[], &HashSet::new(), &[])
+            .await
+            .expect_err("the unreadable pack fails the scan");
+        let msg = err.to_string();
+        assert!(msg.contains("bad-pack"), "{msg}");
+        assert!(
+            !msg.contains(&good.id),
+            "readable pack should be recorded, not listed as a failure: {msg}"
+        );
     }
 }

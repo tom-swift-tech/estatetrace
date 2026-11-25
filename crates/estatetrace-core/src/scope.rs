@@ -14,6 +14,10 @@ pub struct TenantInfo {
     pub access_issue: Option<String>,
 }
 
+fn default_metadata_read() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionInfo {
     pub id: SubscriptionId,
@@ -24,6 +28,54 @@ pub struct SubscriptionInfo {
     pub tags: Value,
     pub access_issue: Option<String>,
     pub last_refresh: Option<DateTime<Utc>>,
+    /// False when this refresh could not read quota ID and tags. Refresh then keeps the
+    /// stored values. Omitted from API JSON; missing on deserialize means the values are real.
+    #[serde(default = "default_metadata_read", skip_serializing)]
+    pub metadata_read: bool,
+}
+
+/// A tenant name that is only the tenant id (or blank) is not a display name.
+fn tenant_name_is_placeholder(id: &TenantId, name: &str) -> bool {
+    let name = name.trim();
+    name.is_empty() || name.eq_ignore_ascii_case(id.as_str())
+}
+
+/// Apply a discovery refresh without erasing metadata the refresh could not read.
+///
+/// Tenant rows whose name is only the tenant id keep a previously stored display name.
+/// Subscriptions with `metadata_read == false` keep the stored quota ID and tags.
+pub fn merge_discovered_scope(
+    mut tenants: Vec<TenantInfo>,
+    mut subscriptions: Vec<SubscriptionInfo>,
+    previous_tenants: &[TenantInfo],
+    previous_subscriptions: &[SubscriptionInfo],
+) -> (Vec<TenantInfo>, Vec<SubscriptionInfo>) {
+    for tenant in &mut tenants {
+        if !tenant_name_is_placeholder(&tenant.id, &tenant.name) {
+            continue;
+        }
+        if let Some(prev) = previous_tenants
+            .iter()
+            .find(|p| p.id.as_str().eq_ignore_ascii_case(tenant.id.as_str()))
+        {
+            if !tenant_name_is_placeholder(&prev.id, &prev.name) {
+                tenant.name = prev.name.clone();
+            }
+        }
+    }
+    for sub in &mut subscriptions {
+        if sub.metadata_read {
+            continue;
+        }
+        if let Some(prev) = previous_subscriptions
+            .iter()
+            .find(|p| p.id.as_str().eq_ignore_ascii_case(sub.id.as_str()))
+        {
+            sub.quota_id = prev.quota_id.clone();
+            sub.tags = prev.tags.clone();
+        }
+    }
+    (tenants, subscriptions)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -170,6 +170,13 @@ async fn azure_refresh(
             tracing::error!("Azure discovery failed: {e:#}");
             StatusCode::BAD_GATEWAY
         })?;
+    let previous_tenants = db::list_tenants(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let previous_subs = db::list_subscriptions(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (tenants, subs) = merge_discovered_scope(tenants, subs, &previous_tenants, &previous_subs);
     for t in &tenants {
         db::upsert_tenant(&state.pool, t)
             .await
@@ -3048,6 +3055,7 @@ mod classification_api_tests {
                     tags: json!({}),
                     access_issue: None,
                     last_refresh: Some(Utc::now()),
+                    metadata_read: true,
                 },
             )
             .await
@@ -3627,6 +3635,7 @@ mod findings_api_tests {
                     tags: json!({}),
                     access_issue: None,
                     last_refresh: Some(Utc::now()),
+                    metadata_read: true,
                 },
             )
             .await
@@ -4040,6 +4049,7 @@ mod reporting_api_tests {
                     tags: json!({}),
                     access_issue: None,
                     last_refresh: Some(Utc::now()),
+                    metadata_read: true,
                 },
             )
             .await

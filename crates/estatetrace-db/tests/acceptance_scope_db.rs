@@ -40,6 +40,7 @@ async fn ac01_persist_exclude_rename_new_match_and_override() {
                 tags: s.get("tags").cloned().unwrap_or(json!({})),
                 access_issue: None,
                 last_refresh: Some(Utc::now()),
+                metadata_read: true,
             },
         )
         .await
@@ -106,6 +107,7 @@ async fn ac01_persist_exclude_rename_new_match_and_override() {
             tags: json!({}),
             access_issue: None,
             last_refresh: Some(Utc::now()),
+            metadata_read: true,
         },
     )
     .await
@@ -123,6 +125,7 @@ async fn ac01_persist_exclude_rename_new_match_and_override() {
             tags: json!({}),
             access_issue: None,
             last_refresh: Some(Utc::now()),
+            metadata_read: true,
         },
     )
     .await

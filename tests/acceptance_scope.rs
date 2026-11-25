@@ -19,6 +19,7 @@ fn bulk_exclude_rename_and_new_match() {
             tags: s.get("tags").cloned().unwrap_or(json!({})),
             access_issue: None,
             last_refresh: None,
+            metadata_read: true,
         });
     }
 
@@ -62,6 +63,7 @@ fn bulk_exclude_rename_and_new_match() {
         tags: json!({}),
         access_issue: None,
         last_refresh: None,
+        metadata_read: true,
     };
     let (d2, _, _, _) = resolve_subscription_decision(&new_sub, None, &[rule.clone()], None);
     assert_eq!(d2, DecisionKind::Exclude);

@@ -14,6 +14,7 @@ mod tests {
             tags: json!({}),
             access_issue: None,
             last_refresh: None,
+            metadata_read: true,
         }
     }
 
@@ -69,5 +70,60 @@ mod tests {
             resolve_subscription_decision(&renamed, Some(&explicit), &[rule], None);
         assert_eq!(d3, DecisionKind::Track);
         assert_eq!(src3, DecisionSource::Explicit);
+    }
+
+    #[test]
+    fn refresh_keeps_unread_quota_tags_and_tenant_display_name() {
+        let previous_tenant = TenantInfo {
+            id: TenantId::new("tenant-a"),
+            name: "Contoso".into(),
+            needs_sign_in: false,
+            last_refresh: None,
+            access_issue: None,
+        };
+        let mut previous_sub = sub("SUB-1", "Pay as you go", "tenant-a");
+        previous_sub.tags = json!({ "costCenter": "lab" });
+        let mut incoming_sub = sub("sub-1", "Pay as you go", "tenant-a");
+        incoming_sub.quota_id = None;
+        incoming_sub.tags = json!({});
+        incoming_sub.metadata_read = false;
+        let incoming_tenant = TenantInfo {
+            id: TenantId::new("TENANT-A"),
+            name: "TENANT-A".into(),
+            needs_sign_in: false,
+            last_refresh: None,
+            access_issue: None,
+        };
+        let (tenants, subs) = merge_discovered_scope(
+            vec![incoming_tenant],
+            vec![incoming_sub],
+            &[previous_tenant],
+            &[previous_sub],
+        );
+        assert_eq!(tenants[0].name, "Contoso");
+        assert_eq!(subs[0].quota_id.as_deref(), Some("MSDN_2014-09-01"));
+        assert_eq!(subs[0].tags, json!({ "costCenter": "lab" }));
+    }
+
+    #[test]
+    fn refresh_applies_quota_and_tags_when_metadata_was_read() {
+        let mut previous = sub("sub-1", "Old", "tenant-a");
+        previous.tags = json!({ "costCenter": "lab" });
+        let mut incoming = sub("sub-1", "Old", "tenant-a");
+        incoming.quota_id = None;
+        incoming.tags = json!({});
+        incoming.metadata_read = true;
+        let named = TenantInfo {
+            id: TenantId::new("tenant-a"),
+            name: "Contoso".into(),
+            needs_sign_in: false,
+            last_refresh: None,
+            access_issue: None,
+        };
+        let (tenants, subs) =
+            merge_discovered_scope(vec![named], vec![incoming], &[], &[previous]);
+        assert_eq!(tenants[0].name, "Contoso");
+        assert!(subs[0].quota_id.is_none());
+        assert_eq!(subs[0].tags, json!({}));
     }
 }

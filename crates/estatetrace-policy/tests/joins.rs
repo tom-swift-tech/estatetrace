@@ -3,7 +3,8 @@
 use chrono::{TimeZone, Utc};
 use estatetrace_core::*;
 use estatetrace_policy::{
-    builtin_resource_kinds, evaluate_pack, parse_pack_yaml, resource_view, JoinIndex, PolicyPack,
+    builtin_resource_kinds, evaluate_pack, in_tracked_subscriptions, parse_pack_yaml, resource_view,
+    JoinIndex, PolicyPack,
 };
 use serde_json::{json, Value};
 
@@ -321,4 +322,28 @@ fn baseline_example_join_control_cases() {
     assert_eq!(unknown.detail, "joined subnet is outside the visible scope");
     assert!(ours.iter().any(|r| r.got == "pass"));
     assert!(ours.iter().any(|r| r.got == "fail"));
+}
+
+#[test]
+fn excluded_subscription_vnet_is_not_indexed() {
+    let tracked = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let excluded = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    let mut kept = vnet();
+    kept.subscription_id = SubscriptionId::new(tracked);
+    let mut dropped_vnet = vnet();
+    dropped_vnet.id = "obs-vnet-excluded".into();
+    dropped_vnet.subscription_id = SubscriptionId::new(excluded);
+    let visible = in_tracked_subscriptions(&[kept, dropped_vnet], &[tracked]);
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].subscription_id.as_str(), tracked);
+    assert!(JoinIndex::build(&visible).subnet(&subnet_id("snet-guarded")).is_some());
+
+    let mut only_excluded = vnet();
+    only_excluded.subscription_id = SubscriptionId::new(excluded);
+    let hidden = JoinIndex::build(&in_tracked_subscriptions(&[only_excluded], &[tracked]));
+    assert!(hidden.subnet(&subnet_id("snet-guarded")).is_none());
+
+    let mut upper = vnet();
+    upper.subscription_id = SubscriptionId::new(tracked.to_ascii_uppercase());
+    assert_eq!(in_tracked_subscriptions(&[upper], &[tracked]).len(), 1);
 }
