@@ -348,3 +348,39 @@ export async function saveOwnershipConfig(ownership: OwnershipConfig | null) {
     ownership,
   });
 }
+
+/** Phase 7: one compile lint issue (spec §4.8). */
+export interface CompileIssue {
+  severity: "error" | "warning";
+  control_id?: string | null;
+  message: string;
+}
+
+export interface CompilePackResult {
+  /** The compiled pack, or null when any issue is an error (HTTP 422). */
+  pack: Record<string, unknown> | null;
+  issues: CompileIssue[];
+}
+
+/** Compile catalog + check map (+ settings) text into a pack. A 422 still returns its issues. */
+export async function compilePack(body: {
+  catalog: string;
+  check_map: string;
+  settings?: string;
+}): Promise<CompilePackResult> {
+  await ensureSession();
+  const res = await fetch("/api/packs/compile", {
+    method: "POST",
+    headers: {
+      "x-session-token": sessionToken,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const ct = res.headers.get("content-type") || "";
+  const data = ct.includes("application/json") ? await res.json() : undefined;
+  if (res.ok || (res.status === 422 && data && Array.isArray(data.issues))) {
+    return { pack: data.pack ?? null, issues: data.issues ?? [] };
+  }
+  throw new Error(`${res.status} ${res.statusText}`);
+}

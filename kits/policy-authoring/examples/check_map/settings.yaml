@@ -1,0 +1,19 @@
+# Compile settings for the fictional check-map example. All values are invented.
+#
+# named_values:    values a check map leaf references with expected_setting
+# suppress:        controls dropped from the compiled pack, with the reason
+#                  ({ control, reason, duplicate_of })
+# check_overrides: per control ID (or <control_id>/<suffix>), replace fields of one leaf:
+#                  { leaf: <leaf name or path>, reason: <why>, <leaf fields to replace> }
+#                  The reason is kept in the leaf note and the control's judges.
+named_values:
+  approved_host_pool_access: [Disabled, EnabledForClientsOnly]
+
+suppress: []
+
+check_overrides: {}
+  # Example (commented out):
+  # EXW-STG-01:
+  #   leaf: minimum TLS
+  #   reason: Legacy partner integration accepted until the next review
+  #   expected: TLS1_1
