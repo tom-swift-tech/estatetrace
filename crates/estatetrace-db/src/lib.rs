@@ -1,9 +1,11 @@
 //! SQLite persistence for EstateTrace.
 
 mod findings;
+mod reporting;
 mod repo;
 
 pub use findings::*;
+pub use reporting::*;
 pub use repo::*;
 
 use anyhow::{Context, Result};

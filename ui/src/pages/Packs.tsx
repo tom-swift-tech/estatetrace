@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
-import { api, compilePack, type CompilePackResult } from "../api";
+import {
+  activatePack,
+  api,
+  compilePack,
+  deactivatePack,
+  type CompilePackResult,
+} from "../api";
 
 type ImportTab = "yaml" | "check_map";
 
@@ -157,9 +163,25 @@ export default function Packs() {
   const [result, setResult] = useState<any>(null);
   const [tab, setTab] = useState<ImportTab>("yaml");
 
+  const [busy, setBusy] = useState(false);
+
   async function load() {
     const d = await api<{ packs: any[] }>("/packs");
     setPacks(d.packs || []);
+  }
+
+  /** Activate or deactivate after confirmation, then show the result and reload. */
+  async function runAction(question: string, action: () => Promise<unknown>) {
+    if (!window.confirm(question)) return;
+    setBusy(true);
+    try {
+      setResult(await action());
+    } catch (e) {
+      setResult({ error: String(e) });
+    } finally {
+      setBusy(false);
+      await load();
+    }
   }
 
   useEffect(() => {
@@ -245,6 +267,7 @@ export default function Packs() {
             <th>Revision</th>
             <th>Activated</th>
             <th>Reviewed by</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -256,6 +279,34 @@ export default function Packs() {
               <td>{p.revision}</td>
               <td>{p.activated ? "yes" : "no"}</td>
               <td>{p.reviewed_by}</td>
+              <td>
+                {p.activated ? (
+                  <button
+                    className="secondary"
+                    disabled={busy}
+                    onClick={() =>
+                      runAction(
+                        `Deactivate ${p.id}? Its open findings close as "pack deactivated".`,
+                        () => deactivatePack(p.id),
+                      )
+                    }
+                  >
+                    Deactivate
+                  </button>
+                ) : (
+                  <button
+                    disabled={busy}
+                    onClick={() =>
+                      runAction(
+                        `Activate ${p.id} revision ${p.revision}? Open findings of another active revision close as "pack revision changed".`,
+                        () => activatePack(p.id, p.revision),
+                      )
+                    }
+                  >
+                    Activate
+                  </button>
+                )}
+              </td>
             </tr>
           ))}
         </tbody>

@@ -472,3 +472,104 @@ export async function compilePack(body: {
   }
   throw new Error(`${res.status} ${res.statusText}`);
 }
+
+/* ---- P6: reporting (spec §4.7) ---- */
+
+/** `all` includes both lanes. Reporting endpoints and the inbox default to `security`. */
+export type ReportLane = "security" | "hygiene" | "all";
+
+export type QueueGroupBy = "application" | "owner" | "subscription" | "line_of_business";
+
+/** Open fails for one control, lane, environment and group. */
+export interface QueueRow {
+  control_id: string;
+  lane: "security" | "hygiene";
+  /** "" without grouping or when the group is unknown. */
+  group_key: string;
+  environment: string;
+  count: number;
+  subscriptions: number;
+  oldest_opened_at: string;
+  new_since_last_visit: number;
+}
+
+export type AgingBucket = "0-7" | "8-30" | "31-90" | "90+";
+
+export interface AgingRow {
+  control_id: string;
+  bucket: AgingBucket;
+  count: number;
+}
+
+export interface FlowRow {
+  /** UTC day, YYYY-MM-DD. */
+  day: string;
+  control_id: string;
+  opened: number;
+  closed: number;
+}
+
+export interface TrendRow {
+  scan_id: string;
+  scan_started_at: string;
+  control_id: string;
+  lane: "security" | "hygiene";
+  open: number;
+}
+
+function reportQuery(params: Record<string, string | number | undefined>): string {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== "") p.set(k, String(v));
+  }
+  const qs = p.toString();
+  return qs ? `?${qs}` : "";
+}
+
+export function complianceQueue(lane: ReportLane = "security", groupBy?: QueueGroupBy | "") {
+  return api<{ rows: QueueRow[]; last_visit?: string | null }>(
+    `/compliance/queue${reportQuery({ lane, group_by: groupBy || undefined })}`,
+  );
+}
+
+export function complianceAging(lane: ReportLane = "security") {
+  return api<{ rows: AgingRow[]; buckets: AgingBucket[] }>(
+    `/compliance/aging${reportQuery({ lane })}`,
+  );
+}
+
+export function complianceFlow(lane: ReportLane = "security", days = 90) {
+  return api<{ rows: FlowRow[]; days: number }>(
+    `/compliance/flow${reportQuery({ lane, days })}`,
+  );
+}
+
+export function complianceTrend(lane: ReportLane = "security") {
+  return api<{ rows: TrendRow[]; scans: { scan_id: string; started_at: string }[] }>(
+    `/compliance/trend${reportQuery({ lane })}`,
+  );
+}
+
+/** Leadership readout: aggregates only, no resource IDs (AC-P6-5). */
+export function exportReadout() {
+  return apiBlob("/evidence/export", {
+    method: "POST",
+    body: JSON.stringify({ format: "readout" }),
+  });
+}
+
+/* ---- Packs: switch the active revision ---- */
+
+export function activatePack(id: string, revision: string) {
+  return postWithError<{ id: string; revision: string; activated: boolean; closed: number }>(
+    `/packs/${encodeURIComponent(id)}/activate`,
+    { revision },
+  );
+}
+
+export function deactivatePack(id: string) {
+  return postWithError<{ id: string; activated: boolean; closed: number }>(
+    `/packs/${encodeURIComponent(id)}/deactivate`,
+    {},
+  );
+}
