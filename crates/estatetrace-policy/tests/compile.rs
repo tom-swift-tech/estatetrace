@@ -590,7 +590,11 @@ fn parse_errors_and_json_input() {
 
 #[test]
 fn fixture_is_fictional() {
+    // Built at runtime so this file does not itself match the invariant-15 grep.
+    let tag_prefix = ["fn", "f_"].concat();
+    let catalog_prefix = ["FN", "F-"].concat();
     for text in [FIX_CATALOG, FIX_MAP, FIX_SETTINGS] {
-        assert!(!text.contains("fnf_") && !text.contains("FNF-"), "invariant 15");
+        assert!(!text.contains(&tag_prefix), "invariant 15");
+        assert!(!text.to_ascii_uppercase().contains(&catalog_prefix), "invariant 15");
     }
 }

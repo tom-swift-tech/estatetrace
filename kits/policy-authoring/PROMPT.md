@@ -25,3 +25,32 @@ Rules:
 - Regular expressions use the Rust `regex` dialect: no lookaround and no backreferences
 - Do not invent Azure write actions beyond suggested remediation metadata
 - Keep quarterly restore tests and similar obligations even when Azure can only supply enrollment evidence (`not_evaluated` with `outside_azure`, or the older `manual: true`)
+
+## Alternative: catalog + check map
+
+When the organization already keeps its policy as a structured catalog (a `catalog` header and a
+`controls` list with `control_id`, `name`, `requirement_level`, `policy_statement`), do not
+rewrite it as a pack. Write a **check map** beside it instead and let EstateTrace compile the two
+(`POST /api/packs/compile`, or **Packs → Catalog + check map** in the UI). A worked, fictional
+example with the full format and lint list is in `examples/check_map/`.
+
+Output for this path:
+1. A check map YAML (`kind: CheckMap`, `catalog_id`, `verified: false`, `checks`, `not_evaluated`)
+2. A settings YAML when needed: `named_values` for approved lists, `suppress` for controls
+   another catalog already asserts, `check_overrides` for operator decisions on one leaf
+
+Rules:
+- Account for every catalog control: under `checks`, or under `not_evaluated` with a category
+  and a note. A control in neither list is a compile error
+- Leaves use `path` and `expected` (the compile maps them to `field` and `value`); `operator`
+  defaults to `equals`. A target is a `resource_kind` plus one inline leaf or `all_of`
+- Use `variants` when the catalog states different levels for subsets of one resource kind (for
+  example `must` on pooled host pools and `should` on personal ones). Each variant needs a
+  `suffix` and a `filter`; do not also put a `filter` on its targets
+- Put approved values the organization may change (regions, SKUs, access settings) in settings
+  `named_values` and reference them with `expected_setting`, rather than copying them into the map
+- Every `check_overrides` entry needs a `reason`; it is kept on the leaf note and the control
+- Leave `verified: false`. An owner sets it to `true` after checking the bindings against real
+  resources, which marks every compiled control `status: verified`
+- The same rules as above apply to `when_absent`, `context`, `not_evaluated` categories, `judges`,
+  `fix` and regular expressions

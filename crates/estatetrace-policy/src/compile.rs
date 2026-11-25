@@ -955,10 +955,7 @@ fn apply_override(
                     return None;
                 }
             };
-            match to_leaf(&merged, None, settings, tn, cid, issues) {
-                Some(l) => *leaf = l,
-                None => return None,
-            }
+            *leaf = to_leaf(&merged, None, settings, tn, cid, issues)?;
         }
     }
     if hits == 0 {
