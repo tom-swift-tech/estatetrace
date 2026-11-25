@@ -206,6 +206,37 @@ impl Collector {
         Ok(out)
     }
 
+    /// Resource-group tags for a subscription from `resourcecontainers`, paged in stable
+    /// resource-ID order with the same throttle retry as inventory (P4, spec §4.6).
+    pub async fn collect_resource_group_tags(
+        &self,
+        subscription_id: &str,
+    ) -> Result<Vec<ResourceGroupTags>> {
+        let query = resource_group_tags_query(subscription_id);
+        let mut out = Vec::new();
+        let mut skip: Option<String> = None;
+        loop {
+            let mut body = json!({
+                "subscriptions": [subscription_id],
+                "query": query,
+                "options": { "resultFormat": "objectArray", "$top": PAGE_SIZE }
+            });
+            if let Some(tok) = &skip {
+                body["options"]["$skipToken"] = json!(tok);
+            }
+            let data = self
+                .arg_query_with_retry(body)
+                .await
+                .context("resource graph resource group tags")?;
+            out.extend(parse_resource_group_tag_rows(&data, subscription_id, Utc::now()));
+            skip = next_skip_token(&data);
+            if skip.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     async fn arg_query_with_retry(&self, body: Value) -> Result<Value> {
         let mut attempt = 0u32;
         loop {
@@ -262,6 +293,56 @@ impl Default for Collector {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn resource_group_tags_query(subscription_id: &str) -> String {
+    format!(
+        "ResourceContainers | where type =~ 'microsoft.resources/subscriptions/resourcegroups' and subscriptionId =~ '{subscription_id}' | order by id asc | project id, name, subscriptionId, tags"
+    )
+}
+
+fn next_skip_token(data: &Value) -> Option<String> {
+    data.get("$skipToken")
+        .or_else(|| data.pointer("/options/$skipToken"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Turn one Resource Graph page of `resourcecontainers` rows into `ResourceGroupTags`.
+/// Rows without a name are skipped; missing or null tags become `{}`.
+pub fn parse_resource_group_tag_rows(
+    data: &Value,
+    subscription_id: &str,
+    observed_at: chrono::DateTime<Utc>,
+) -> Vec<ResourceGroupTags> {
+    data.get("data")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    let name = row.get("name").and_then(|v| v.as_str())?.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let tags = match row.get("tags") {
+                        Some(t @ Value::Object(_)) => t.clone(),
+                        _ => json!({}),
+                    };
+                    Some(ResourceGroupTags {
+                        subscription_id: SubscriptionId::new(
+                            row.get("subscriptionId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(subscription_id)
+                                .to_string(),
+                        ),
+                        resource_group: name.to_string(),
+                        tags,
+                        observed_at,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn is_throttle(e: &anyhow::Error) -> bool {
@@ -424,4 +505,43 @@ pub async fn run_full_scan_for_subscription(
     let provider_changes = collector.collect_changes(subscription_id, None).await?;
     changes.extend(provider_changes);
     Ok((all, changes, checkpoint, complete))
+}
+
+#[cfg(test)]
+mod resource_group_tag_tests {
+    use super::*;
+
+    #[test]
+    fn parses_resourcecontainers_fixture_page() {
+        let page = json!({
+            "totalRecords": 3,
+            "count": 3,
+            "data": [
+                {
+                    "id": "/subscriptions/sub-contoso-01/resourceGroups/rg-app",
+                    "name": "rg-app",
+                    "subscriptionId": "sub-contoso-01",
+                    "tags": { "Environment": "prod", "app": "Payments" }
+                },
+                {
+                    "id": "/subscriptions/sub-contoso-01/resourceGroups/rg-untagged",
+                    "name": "rg-untagged",
+                    "subscriptionId": "sub-contoso-01",
+                    "tags": null
+                },
+                { "id": "/subscriptions/sub-contoso-01/resourceGroups/x", "name": "" }
+            ],
+            "$skipToken": "next-page"
+        });
+        let at = Utc::now();
+        let rows = parse_resource_group_tag_rows(&page, "sub-contoso-01", at);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].resource_group, "rg-app");
+        assert_eq!(rows[0].subscription_id.as_str(), "sub-contoso-01");
+        assert_eq!(rows[0].tags["Environment"], "prod");
+        assert_eq!(rows[1].tags, json!({}));
+        assert_eq!(next_skip_token(&page).as_deref(), Some("next-page"));
+        assert!(next_skip_token(&json!({ "data": [] })).is_none());
+        assert!(resource_group_tags_query("sub-contoso-01").contains("resourcegroups"));
+    }
 }

@@ -72,6 +72,16 @@ pub async fn run_scan_for(state: &AppState, subscription_ids: Option<&[String]>)
         {
             Ok(resources) => {
                 all_obs.extend(resources);
+                // P4: refresh resource-group tags (environment fallback + ownership).
+                // Best effort: a failure here never fails the inventory pass.
+                match collector.collect_resource_group_tags(sub.id.as_str()).await {
+                    Ok(rg_tags) => {
+                        if let Err(e) = db::upsert_resource_group_tags(&state.pool, &rg_tags).await {
+                            warn!("resource group tag upsert failed for {}: {e}", sub.id);
+                        }
+                    }
+                    Err(e) => warn!("resource group tag query failed for {}: {e}", sub.id),
+                }
             }
             Err(e) => {
                 warn!("scan failed for {}: {e}", sub.id);

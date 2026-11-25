@@ -129,6 +129,7 @@ mod tests {
                 "header_name": "Ocp-Apim-Subscription-Key"
             })),
             theme_path: Some("themes/company.yaml".into()),
+            ownership: None,
         };
         let text = serde_json::to_string_pretty(&settings).unwrap();
         assert!(!text.to_ascii_lowercase().contains("password"));

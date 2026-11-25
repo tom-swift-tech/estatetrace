@@ -747,9 +747,14 @@ pub async fn list_coverage(pool: &SqlitePool) -> Result<Vec<SourceCoverage>> {
 }
 
 pub async fn upsert_classification_rule(pool: &SqlitePool, rule: &ClassificationRule) -> Result<()> {
+    let segment_map_json = rule
+        .segment_map
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
     sqlx::query(
-        "INSERT INTO classification_rules(id, kind, subscription_id, resource_group, tag_key, tag_value, environment, priority)
-         VALUES(?,?,?,?,?,?,?,?)
+        "INSERT INTO classification_rules(id, kind, subscription_id, resource_group, tag_key, tag_value, environment, priority, pattern, segment_map_json)
+         VALUES(?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET
            kind=excluded.kind,
            subscription_id=excluded.subscription_id,
@@ -757,58 +762,57 @@ pub async fn upsert_classification_rule(pool: &SqlitePool, rule: &Classification
            tag_key=excluded.tag_key,
            tag_value=excluded.tag_value,
            environment=excluded.environment,
-           priority=excluded.priority",
+           priority=excluded.priority,
+           pattern=excluded.pattern,
+           segment_map_json=excluded.segment_map_json",
     )
     .bind(&rule.id)
-    .bind(match rule.kind {
-        ClassificationRuleKind::Subscription => "subscription",
-        ClassificationRuleKind::ResourceGroup => "resource_group",
-        ClassificationRuleKind::Tag => "tag",
-    })
+    .bind(rule.kind.as_str())
     .bind(rule.subscription_id.as_ref().map(|s| s.as_str().to_string()))
     .bind(&rule.resource_group)
     .bind(&rule.tag_key)
     .bind(&rule.tag_value)
     .bind(rule.environment.as_str())
     .bind(rule.priority)
+    .bind(&rule.pattern)
+    .bind(segment_map_json)
     .execute(pool)
     .await?;
     Ok(())
 }
 
+type ClassificationRuleRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+);
+
 pub async fn list_classification_rules(pool: &SqlitePool) -> Result<Vec<ClassificationRule>> {
-    let rows = sqlx::query_as::<
-        _,
-        (
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            String,
-            i64,
-        ),
-    >(
-        "SELECT id, kind, subscription_id, resource_group, tag_key, tag_value, environment, priority FROM classification_rules",
+    let rows = sqlx::query_as::<_, ClassificationRuleRow>(
+        "SELECT id, kind, subscription_id, resource_group, tag_key, tag_value, environment, priority, pattern, segment_map_json FROM classification_rules",
     )
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, kind, sid, rg, tk, tv, env, pri)| ClassificationRule {
+        .map(|(id, kind, sid, rg, tk, tv, env, pri, pattern, seg)| ClassificationRule {
             id,
-            kind: match kind.as_str() {
-                "resource_group" => ClassificationRuleKind::ResourceGroup,
-                "tag" => ClassificationRuleKind::Tag,
-                _ => ClassificationRuleKind::Subscription,
-            },
+            kind: ClassificationRuleKind::parse(&kind).unwrap_or(ClassificationRuleKind::Subscription),
             subscription_id: sid.map(SubscriptionId::new),
             resource_group: rg,
             tag_key: tk,
             tag_value: tv,
             environment: EnvironmentClass::parse(&env).unwrap_or(EnvironmentClass::Unknown),
             priority: pri as i32,
+            pattern,
+            segment_map: seg.and_then(|j| serde_json::from_str(&j).ok()),
         })
         .collect())
 }
@@ -1460,4 +1464,53 @@ pub async fn latest_disposition_for_evaluation(
 ) -> Result<Option<DispositionRecord>> {
     let rows = list_dispositions(pool, Some(evaluation_id)).await?;
     Ok(rows.into_iter().next())
+}
+
+/// Replace the stored tags for each (subscription, resource group). Case-insensitive on RG name.
+pub async fn upsert_resource_group_tags(pool: &SqlitePool, rows: &[ResourceGroupTags]) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for r in rows {
+        sqlx::query(
+            "INSERT INTO resource_group_tags(subscription_id, resource_group, tags_json, observed_at)
+             VALUES(?,?,?,?)
+             ON CONFLICT(subscription_id, resource_group) DO UPDATE SET
+               resource_group=excluded.resource_group,
+               tags_json=excluded.tags_json,
+               observed_at=excluded.observed_at",
+        )
+        .bind(r.subscription_id.as_str())
+        .bind(&r.resource_group)
+        .bind(serde_json::to_string(&r.tags)?)
+        .bind(r.observed_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Stored resource-group tags, optionally for one subscription.
+pub async fn get_resource_group_tags(
+    pool: &SqlitePool,
+    subscription_id: Option<&str>,
+) -> Result<Vec<ResourceGroupTags>> {
+    let rows = sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT subscription_id, resource_group, tags_json, observed_at FROM resource_group_tags
+         WHERE (?1 IS NULL OR subscription_id = ?1)
+         ORDER BY subscription_id, resource_group",
+    )
+    .bind(subscription_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(sid, rg, tags, at)| ResourceGroupTags {
+            subscription_id: SubscriptionId::new(sid),
+            resource_group: rg,
+            tags: serde_json::from_str(&tags).unwrap_or(Value::Object(Default::default())),
+            observed_at: DateTime::parse_from_rfc3339(&at)
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        })
+        .collect())
 }
