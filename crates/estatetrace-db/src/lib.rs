@@ -31,10 +31,11 @@ pub async fn open_db(path: &Path) -> Result<SqlitePool> {
 }
 
 /// Versioned migrations applied after `001_init.sql`, in ascending order.
-/// Each runs once, inside a transaction, when `meta.schema_version` is below its number.
+/// Each runs once, inside a transaction, and is recorded in `schema_migrations`.
 /// Add new entries at the end; never edit or renumber an entry that has shipped.
 pub const MIGRATIONS: &[(i64, &str)] = &[
     (3, include_str!("../migrations/003_exception_scope.sql")),
+    (4, include_str!("../migrations/004_classification.sql")),
 ];
 
 pub async fn migrate(pool: &SqlitePool) -> Result<()> {

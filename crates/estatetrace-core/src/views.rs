@@ -44,6 +44,9 @@ pub struct SettingsDoc {
     pub servicenow: Option<Value>,
     pub chat: Option<Value>,
     pub theme_path: Option<String>,
+    /// Ownership / routing tag names and LOB display names (P4). Operator profile only.
+    #[serde(default)]
+    pub ownership: Option<crate::OwnershipConfig>,
 }
 
 impl Default for SettingsDoc {
@@ -57,6 +60,7 @@ impl Default for SettingsDoc {
             servicenow: None,
             chat: None,
             theme_path: None,
+            ownership: None,
         }
     }
 }
