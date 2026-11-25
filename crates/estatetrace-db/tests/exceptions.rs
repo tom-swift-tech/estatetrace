@@ -63,12 +63,20 @@ async fn ac_p2_4_v1_rows_survive_migration_003() {
     .await
     .unwrap();
     let (v3, sql3) = migration_003();
-    db::meta_set(&pool, "schema_version", &(v3 - 1).to_string())
+    // Forget that 003 was applied when the DB was opened.
+    sqlx::query("DELETE FROM schema_migrations WHERE version = ?")
+        .bind(v3)
+        .execute(&pool)
         .await
         .unwrap();
 
     db::apply_migrations(&pool, &[(v3, sql3)]).await.unwrap();
-    assert_eq!(db::schema_version(&pool).await.unwrap(), v3);
+    let recorded: Option<(i64,)> = sqlx::query_as("SELECT version FROM schema_migrations WHERE version = ?")
+        .bind(v3)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(recorded.is_some(), "003 recorded as applied");
 
     let raw: (String, Option<String>, Option<String>, Option<String>, Option<String>, String) =
         sqlx::query_as(

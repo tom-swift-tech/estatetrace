@@ -11,3 +11,4 @@ ui/dist
 .vscode
 *.zip
 Thumbs.db
+.claude/worktrees/
