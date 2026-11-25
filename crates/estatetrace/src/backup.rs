@@ -130,6 +130,7 @@ mod tests {
             })),
             theme_path: Some("themes/company.yaml".into()),
             ownership: None,
+            scan_guards: Default::default(),
         };
         let text = serde_json::to_string_pretty(&settings).unwrap();
         assert!(!text.to_ascii_lowercase().contains("password"));

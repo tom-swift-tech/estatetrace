@@ -1666,3 +1666,17 @@ pub async fn list_coverage_gaps(
         )
         .collect())
 }
+/// Latest observation of every resource not currently marked missing from its subscription's
+/// inventory. Use this for evaluation-time joins, where a deleted parent must not supply data.
+pub async fn list_present_resources(pool: &SqlitePool) -> Result<Vec<ResourceObservation>> {
+    let ids: Vec<(String,)> =
+        sqlx::query_as("SELECT resource_id FROM latest_resources WHERE missing = 0")
+            .fetch_all(pool)
+            .await?;
+    let present: std::collections::HashSet<String> = ids.into_iter().map(|r| r.0).collect();
+    Ok(list_latest_resources(pool)
+        .await?
+        .into_iter()
+        .filter(|o| present.contains(o.resource_id.as_str()))
+        .collect())
+}

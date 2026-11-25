@@ -173,6 +173,23 @@ async fn scan_subscription_paged(
         all_new.extend(batch.resources);
 
         if batch.complete {
+            // P5.1 drop guard: a complete pass that suddenly returns far fewer resources (lost
+            // access, throttled partial answer, wrong context) must not infer deletions.
+            let guards = state.settings.read().await.scan_guards.clone();
+            let missing = previous
+                .iter()
+                .filter(|p| !seen.contains(&p.resource_id))
+                .count();
+            let drop = guards.check_drop(previous.len(), missing);
+            let infer_deletions = started_from_beginning && drop.deletions_allowed;
+            let note = if started_from_beginning && !drop.deletions_allowed {
+                let n = guards.note(previous.len(), seen.len(), &drop);
+                warn!("{subscription_id}: {n}");
+                Some(n)
+            } else {
+                None
+            };
+
             // Full inventory page sequence finished — clear checkpoint.
             db::upsert_coverage(
                 &state.pool,
@@ -180,12 +197,13 @@ async fn scan_subscription_paged(
                 subscription_id,
                 None,
                 true,
-                None,
+                note.as_deref(),
             )
             .await?;
 
-            // Never mark_missing unless this pass covered the estate from the start.
-            if started_from_beginning {
+            // Never mark_missing unless this pass covered the estate from the start
+            // and passed the drop guard.
+            if infer_deletions {
                 for prev in previous {
                     if !seen.contains(&prev.resource_id) {
                         db::mark_missing(
@@ -198,10 +216,11 @@ async fn scan_subscription_paged(
                 }
             }
 
-            let mut changes = if started_from_beginning {
+            let mut changes = if infer_deletions {
                 diff_observations(previous, &all_new, scan_id)
             } else {
-                // Resumed tail only: emit create/update for seen resources, never missing.
+                // Resumed tail, or a guarded drop: emit create/update for seen resources,
+                // never missing.
                 let prev_seen: Vec<_> = previous
                     .iter()
                     .filter(|p| seen.contains(&p.resource_id))
@@ -221,7 +240,8 @@ async fn scan_subscription_paged(
 
             return Ok(SubscriptionPass {
                 resources: all_new,
-                complete_from_beginning: started_from_beginning,
+                // A guarded drop must not close finding intervals by absence either.
+                complete_from_beginning: infer_deletions,
             });
         }
 
@@ -294,7 +314,8 @@ async fn evaluate_active_packs(
         classify(&input, &rules).environment
     };
     let kinds = builtin_resource_kinds();
-    let joins = JoinIndex::build(&db::list_latest_resources(&state.pool).await?);
+    // Joins use only resources still present: a VNet marked missing must not supply subnets.
+    let joins = JoinIndex::build(&db::list_present_resources(&state.pool).await?);
     let mut failures: Vec<String> = Vec::new();
     for p in packs {
         let content = p.get("content").cloned().unwrap_or_default();
