@@ -11,7 +11,7 @@
 
 use estatetrace_core::ResourceObservation;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 const VNET_TYPE: &str = "microsoft.network/virtualnetworks";
 const SUBNET_TYPE: &str = "microsoft.network/virtualnetworks/subnets";
@@ -139,6 +139,26 @@ impl JoinIndex {
         };
         Some(json!({ "subnet": joined }))
     }
+}
+
+/// Observations whose subscription is in the tracked scope, compared case-insensitively.
+///
+/// Join evidence is limited to this set. A VNet in an excluded subscription stays in the
+/// local inventory, but it is outside the visible scope and must not supply `join.subnet`
+/// (AC-P5-2).
+pub fn in_tracked_subscriptions(
+    resources: &[ResourceObservation],
+    tracked_subscription_ids: &[impl AsRef<str>],
+) -> Vec<ResourceObservation> {
+    let tracked: HashSet<String> = tracked_subscription_ids
+        .iter()
+        .map(|s| s.as_ref().to_ascii_lowercase())
+        .collect();
+    resources
+        .iter()
+        .filter(|o| tracked.contains(&o.subscription_id.as_str().to_ascii_lowercase()))
+        .cloned()
+        .collect()
 }
 
 /// Object key lookup: exact first, then ignoring ASCII case.

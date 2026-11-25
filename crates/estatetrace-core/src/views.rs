@@ -111,10 +111,13 @@ impl ScanGuards {
         }
     }
 
+    /// Coverage note for a blocked drop. The percent is `missing / previous`, so the
+    /// parenthetical reports that missing count and the number seen. Seen can exceed
+    /// `previous - missing` when the pass also created resources.
     pub fn note(&self, previous_count: usize, seen: usize, c: &DropCheck) -> String {
         format!(
-            "resource count dropped {}% ({previous_count} -> {seen}); deletions not inferred (tolerance {}%)",
-            c.drop_percent, self.resource_drop_tolerance_percent
+            "resource count dropped {}% ({} of {previous_count} previous resources missing, {seen} seen); deletions not inferred (tolerance {}%)",
+            c.drop_percent, c.missing, self.resource_drop_tolerance_percent
         )
     }
 }
@@ -129,7 +132,21 @@ mod scan_guard_tests {
         let c = g.check_drop(500, 490);
         assert!(!c.deletions_allowed);
         assert_eq!(c.drop_percent, 98);
-        assert!(g.note(500, 10, &c).contains("dropped 98%"));
+        let note = g.note(500, 10, &c);
+        assert!(note.contains("dropped 98%"), "{note}");
+        assert!(note.contains("490 of 500 previous resources missing"), "{note}");
+        assert!(note.contains("10 seen"), "{note}");
+        assert!(note.contains("deletions not inferred"), "{note}");
+    }
+
+    #[test]
+    fn drop_note_reports_missing_count_when_creates_offset_deletes() {
+        let g = ScanGuards::default();
+        // 60 of 100 missing, but 40 new resources make the seen count 80.
+        let c = g.check_drop(100, 60);
+        let note = g.note(100, 80, &c);
+        assert!(note.contains("dropped 60%"), "{note}");
+        assert!(note.contains("60 of 100 previous resources missing, 80 seen"), "{note}");
     }
 
     #[test]

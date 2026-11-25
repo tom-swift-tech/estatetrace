@@ -99,6 +99,7 @@ pub async fn list_subscriptions(pool: &SqlitePool) -> Result<Vec<SubscriptionInf
             tags: serde_json::from_str(&tags).unwrap_or(Value::Object(Default::default())),
             access_issue: ai,
             last_refresh: lr.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))),
+            metadata_read: true,
         })
         .collect())
 }
