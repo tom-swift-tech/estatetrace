@@ -37,6 +37,7 @@ example_cases: []
         observation_time: Utc::now(),
         evidence_available: true,
         lifecycle_epoch: 1,
+        arm_meta: serde_json::json!({}),
     };
     let result = evaluate_pack(
         &pack,

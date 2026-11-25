@@ -42,7 +42,7 @@ impl Collector {
         skip_token: Option<&str>,
     ) -> Result<InventoryBatch> {
         let query = format!(
-            "Resources | where subscriptionId =~ '{subscription_id}' | order by id asc | project id, name, type, location, resourceGroup, subscriptionId, tenantId, tags, properties"
+            "Resources | where subscriptionId =~ '{subscription_id}' | order by id asc | project id, name, type, location, resourceGroup, subscriptionId, tenantId, tags, properties, kind, sku, identity, plan, zones, managedBy, extendedLocation"
         );
 
         let mut body = json!({
@@ -110,6 +110,7 @@ impl Collector {
                 observation_time: now,
                 evidence_available: true,
                 lifecycle_epoch: 1,
+                arm_meta: arm_meta_from_row(&row),
             });
         }
 
@@ -543,5 +544,45 @@ mod resource_group_tag_tests {
         assert_eq!(next_skip_token(&page).as_deref(), Some("next-page"));
         assert!(next_skip_token(&json!({ "data": [] })).is_none());
         assert!(resource_group_tags_query("sub-contoso-01").contains("resourcegroups"));
+    }
+}
+
+/// Top-level Resource Graph fields kept outside `properties`. Null and empty values are dropped
+/// so `exists` checks behave the same as for properties.
+pub fn arm_meta_from_row(row: &Value) -> Value {
+    const KEYS: &[&str] = &["kind", "sku", "identity", "plan", "zones", "managedBy", "extendedLocation"];
+    let mut out = serde_json::Map::new();
+    for k in KEYS {
+        match row.get(*k) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(s)) if s.is_empty() => {}
+            Some(v) => {
+                out.insert((*k).to_string(), v.clone());
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+#[cfg(test)]
+mod arm_meta_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_present_top_level_fields_and_drops_nulls() {
+        let row = json!({
+            "id": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.Web/sites/fa1",
+            "kind": "functionapp,linux",
+            "sku": null,
+            "identity": {"type": "SystemAssigned"},
+            "zones": ["1"],
+            "managedBy": ""
+        });
+        let meta = arm_meta_from_row(&row);
+        assert_eq!(meta["kind"], "functionapp,linux");
+        assert_eq!(meta["identity"]["type"], "SystemAssigned");
+        assert_eq!(meta["zones"][0], "1");
+        assert!(meta.get("sku").is_none());
+        assert!(meta.get("managedBy").is_none());
     }
 }

@@ -388,8 +388,8 @@ pub async fn insert_observation(pool: &SqlitePool, obs: &ResourceObservation) ->
         "INSERT INTO resource_observations(
             id, provider, resource_id, tenant_id, subscription_id, resource_type, name,
             location, resource_group, tags_json, properties_json, scan_id, observation_time,
-            evidence_available, lifecycle_epoch)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            evidence_available, lifecycle_epoch, arm_meta_json)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&obs.id)
     .bind(obs.provider.as_str())
@@ -406,6 +406,7 @@ pub async fn insert_observation(pool: &SqlitePool, obs: &ResourceObservation) ->
     .bind(obs.observation_time.to_rfc3339())
     .bind(obs.evidence_available as i64)
     .bind(obs.lifecycle_epoch)
+    .bind(obs.arm_meta.to_string())
     .execute(pool)
     .await?;
 
@@ -462,11 +463,12 @@ pub async fn latest_observation(
             String,
             i64,
             i64,
+            String,
         ),
     >(
         "SELECT o.id, o.provider, o.resource_id, o.tenant_id, o.subscription_id, o.resource_type, o.name,
                 o.location, o.resource_group, o.tags_json, o.properties_json, o.scan_id, o.observation_time,
-                o.evidence_available, o.lifecycle_epoch
+                o.evidence_available, o.lifecycle_epoch, o.arm_meta_json
          FROM latest_resources l
          JOIN resource_observations o ON o.id = l.observation_id
          WHERE l.resource_id = ?",
@@ -496,11 +498,12 @@ pub async fn list_latest_resources(pool: &SqlitePool) -> Result<Vec<ResourceObse
             String,
             i64,
             i64,
+            String,
         ),
     >(
         "SELECT o.id, o.provider, o.resource_id, o.tenant_id, o.subscription_id, o.resource_type, o.name,
                 o.location, o.resource_group, o.tags_json, o.properties_json, o.scan_id, o.observation_time,
-                o.evidence_available, o.lifecycle_epoch
+                o.evidence_available, o.lifecycle_epoch, o.arm_meta_json
          FROM latest_resources l
          JOIN resource_observations o ON o.id = l.observation_id
          ORDER BY o.name",
@@ -527,6 +530,7 @@ fn map_obs(
         String,
         i64,
         i64,
+        String,
     ),
 ) -> ResourceObservation {
     let (
@@ -545,6 +549,7 @@ fn map_obs(
         ot,
         evidence,
         epoch,
+        arm_meta,
     ) = row;
     ResourceObservation {
         id,
@@ -564,6 +569,7 @@ fn map_obs(
             .unwrap_or_else(|_| Utc::now()),
         evidence_available: evidence != 0,
         lifecycle_epoch: epoch,
+        arm_meta: serde_json::from_str(&arm_meta).unwrap_or(Value::Object(Default::default())),
     }
 }
 

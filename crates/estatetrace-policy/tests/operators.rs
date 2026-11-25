@@ -29,6 +29,7 @@ fn obs(name: &str, rtype: &str, properties: Value, tags: Value) -> ResourceObser
         observation_time: Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).unwrap(),
         evidence_available: true,
         lifecycle_epoch: 1,
+        arm_meta: serde_json::json!({}),
     }
 }
 

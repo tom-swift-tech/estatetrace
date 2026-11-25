@@ -44,6 +44,14 @@ pub struct ResourceObservation {
     pub observation_time: DateTime<Utc>,
     pub evidence_available: bool,
     pub lifecycle_epoch: i64,
+    /// Top-level Resource Graph fields outside `properties`: kind, sku, identity, plan,
+    /// zones, managedBy, extendedLocation (only those present). `{}` when none.
+    #[serde(default = "empty_object")]
+    pub arm_meta: Value,
+}
+
+fn empty_object() -> Value {
+    Value::Object(Default::default())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

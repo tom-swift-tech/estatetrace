@@ -197,9 +197,9 @@ pub struct Evaluation { /* existing fields */ pub environment: EnvironmentClass,
 // evidence JSON gains: "detail", "assumed_default", "context": {label: value}, "target_resource_type"
 ```
 
-### 4.4 Findings store (`finding_intervals` in migration `005_findings.sql`; `coverage_gaps` in `002_coverage_gaps.sql`)
+### 4.4 Findings store (`finding_intervals` in migration `006_findings.sql`; `coverage_gaps` in `002_coverage_gaps.sql`)
 
-Migration numbers: 002 coverage_gaps (P1), 003 exception_scope (P2), 004 classification (P4), 005 findings (P3).
+Migration numbers: 002 coverage_gaps (P1), 003 exception_scope (P2), 004 classification (P4), 005 observation_arm_meta (top-level ARG fields), 006 findings (P3).
 
 ```sql
 CREATE TABLE finding_intervals (

@@ -22,6 +22,7 @@ mod tests {
             observation_time: Utc::now(),
             evidence_available: true,
             lifecycle_epoch: 1,
+            arm_meta: serde_json::json!({}),
         };
         let rules = vec![ClassificationRule {
             id: "prod-sub".into(),
@@ -70,6 +71,7 @@ mod p4 {
             observation_time: Utc::now(),
             evidence_available: true,
             lifecycle_epoch: 1,
+            arm_meta: serde_json::json!({}),
         }
     }
 

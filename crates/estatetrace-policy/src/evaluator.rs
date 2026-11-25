@@ -76,6 +76,12 @@ pub fn resource_view(obs: &ResourceObservation, joins: &JoinIndex) -> Value {
         "resourceGroup": obs.resource_group,
         "name": obs.name,
     });
+    // Top-level ARG fields (kind, sku, identity, ...) sit beside `properties`, as in Resource Graph.
+    if let (Some(meta), Some(v)) = (obs.arm_meta.as_object(), view.as_object_mut()) {
+        for (k, val) in meta {
+            v.entry(k.clone()).or_insert_with(|| val.clone());
+        }
+    }
     if let Some(j) = joins.view_for(obs) {
         view["join"] = j;
     }

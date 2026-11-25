@@ -23,7 +23,7 @@ Releasable checkpoints: **A = P0–P3** (trustworthy findings), **B = +P4/P5**, 
 
 | # | Task | Files | Verifies |
 | --- | --- | --- | --- |
-| 0.1 | Keep running `001_init.sql` every time (idempotent). Add an ordered list `[(2, include_str!("002_findings.sql")), …]`. Apply each where `meta.schema_version < n` inside one transaction, then set the version. **Done** (`MIGRATIONS` const in `estatetrace-db/src/lib.rs`). Numbers: 002 coverage_gaps (P1), 003 exception_scope (P2), 004 classification (P4), 005 findings (P3). | `crates/estatetrace-db/src/lib.rs` | AC-P0-1, AC-P0-2 |
+| 0.1 | Keep running `001_init.sql` every time (idempotent). Add an ordered list `[(2, include_str!("002_findings.sql")), …]`. Apply each where `meta.schema_version < n` inside one transaction, then set the version. **Done** (`MIGRATIONS` const in `estatetrace-db/src/lib.rs`). Numbers: 002 coverage_gaps (P1), 003 exception_scope (P2), 004 classification (P4), 005 observation_arm_meta (top-level ARG fields), 006 findings (P3). | `crates/estatetrace-db/src/lib.rs` | AC-P0-1, AC-P0-2 |
 | 0.2 | Tests: double-migrate on a temp DB; a deliberately broken migration in a test-only list leaves the version unchanged. | `crates/estatetrace-db/tests/migrations.rs` | same |
 
 ## P1: Evaluator v2 (largest phase; contained in `estatetrace-policy` plus the kit)
@@ -58,7 +58,7 @@ Releasable checkpoints: **A = P0–P3** (trustworthy findings), **B = +P4/P5**, 
 
 | # | Task | Files | Verifies |
 | --- | --- | --- | --- |
-| 3.1 | Write `005_findings.sql` (spec §4.4) and add the `FindingInterval`, `CloseReason`, `IntervalStats` and `FindingQuery` types. | migrations, `estatetrace-core/src/findings.rs` | — |
+| 3.1 | Write `006_findings.sql` (spec §4.4) and add the `FindingInterval`, `CloseReason`, `IntervalStats` and `FindingQuery` types. | migrations, `estatetrace-core/src/findings.rs` | — |
 | 3.2 | `record_pack_evaluation`, a port of `Save-ComplianceRun`'s interval SQL (`AzCompliance.Store.psm1:157-183`). In one transaction: stage this scan's results in a temp table; close open intervals whose outcome or pack revision changed; insert new intervals; update continuing ones (detail, evidence, `last_*`). For subscriptions in `complete_subscriptions`, close open intervals with no staged row as `resource_missing` (resource not observed) or `no_longer_targeted` (resource observed but not selected). | `repo.rs` | AC-P3-1..5 |
 | 3.3 | `scan.rs`: track which subscriptions finished a complete from-the-beginning pass, pass that set in, and stop calling `insert_evaluation`. | `scan.rs` | AC-P3-4, 5 |
 | 3.4 | Replace `triage_evaluation`/`triage_with_history` with `triage_interval`: the deadline comes from `opened_at`, and `VerifiedCorrected` comes from an open pass interval whose predecessor for the same key closed as fail with `state_changed`. Fetch the predecessor with a query instead of scanning history. | `findings.rs`, `repo.rs` | AC-P3-2, 6 |

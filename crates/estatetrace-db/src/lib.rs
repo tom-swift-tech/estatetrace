@@ -37,6 +37,7 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
     (2, include_str!("../migrations/002_coverage_gaps.sql")),
     (3, include_str!("../migrations/003_exception_scope.sql")),
     (4, include_str!("../migrations/004_classification.sql")),
+    (5, include_str!("../migrations/005_observation_arm_meta.sql")),
 ];
 
 pub async fn migrate(pool: &SqlitePool) -> Result<()> {
