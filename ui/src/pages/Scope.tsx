@@ -6,6 +6,7 @@ export default function Scope() {
   const [filter, setFilter] = useState("");
   const [preview, setPreview] = useState<any>(null);
   const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState("");
 
   async function load() {
     const data = await api<{ rows: any[] }>("/scope");
@@ -25,18 +26,68 @@ export default function Scope() {
     );
   });
 
+  async function refreshAzure() {
+    setBusy("refresh");
+    setMsg("Refreshing Azure subscriptions…");
+    try {
+      const result = await api<{ tenants: number; subscriptions: number }>(
+        "/azure/refresh",
+        {
+          method: "POST",
+          body: "{}",
+        }
+      );
+      await load();
+      setMsg(
+        `Found ${result.subscriptions} subscription(s) across ${result.tenants} tenant(s).`
+      );
+    } catch (e: unknown) {
+      setMsg(
+        `Azure discovery failed: ${
+          e instanceof Error ? e.message : String(e)
+        }`
+      );
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function setSubscriptionDecision(
+    row: any,
+    decision: "track" | "exclude"
+  ) {
+    setBusy(`${decision}:${row.subscription.id}`);
+    setMsg(`${decision === "track" ? "Tracking" : "Excluding"} ${row.subscription.name}…`);
+    try {
+      await api("/scope/decision", {
+        method: "POST",
+        body: JSON.stringify({
+          tenant_id: row.subscription.tenant_id,
+          subscription_id: row.subscription.id,
+          decision,
+          reason: `explicit ${decision}`,
+        }),
+      });
+      await load();
+      setMsg(
+        `${row.subscription.name} is now ${decision === "track" ? "tracked" : "excluded"}.`
+      );
+    } catch (e: unknown) {
+      setMsg(
+        `Could not ${decision} ${row.subscription.name}: ${
+          e instanceof Error ? e.message : String(e)
+        }`
+      );
+    } finally {
+      setBusy("");
+    }
+  }
+
   return (
     <div>
       <div className="toolbar">
-        <button
-          onClick={async () => {
-            setMsg("Refreshing Azure…");
-            await api("/azure/refresh", { method: "POST", body: "{}" });
-            await load();
-            setMsg("Scope refreshed");
-          }}
-        >
-          Refresh Azure discovery
+        <button onClick={refreshAzure} disabled={busy === "refresh"}>
+          {busy === "refresh" ? "Refreshing…" : "Refresh Azure discovery"}
         </button>
         <input
           placeholder="Search name or paste subscription ID"
@@ -45,42 +96,61 @@ export default function Scope() {
         />
         <button
           className="secondary"
+          disabled={busy !== ""}
           onClick={async () => {
-            const body = {
-              name_contains: filter || "MSDN",
-              offer_mapping: "MSDN",
-            };
-            const p = await api("/scope/exclusion-preview", {
-              method: "POST",
-              body: JSON.stringify(body),
-            });
-            setPreview(p);
+            setBusy("preview");
+            setMsg("Previewing exclusion matches…");
+            try {
+              const body = {
+                name_contains: filter || "MSDN",
+                offer_mapping: "MSDN",
+              };
+              const p = await api<{ match_count: number }>("/scope/exclusion-preview", {
+                method: "POST",
+                body: JSON.stringify(body),
+              });
+              setPreview(p);
+              setMsg(`Preview complete: ${p.match_count} match(es).`);
+            } catch (e: unknown) {
+              setMsg(`Preview failed: ${e instanceof Error ? e.message : String(e)}`);
+            } finally {
+              setBusy("");
+            }
           }}
         >
-          Preview exclusion
+          {busy === "preview" ? "Previewing…" : "Preview exclusion"}
         </button>
         <button
           className="secondary"
+          disabled={busy !== ""}
           onClick={async () => {
-            await api("/scope/exclusion-rules", {
-              method: "POST",
-              body: JSON.stringify({
-                id: "",
-                name: `Exclude ${filter || "MSDN"}`,
-                tenant_id: null,
-                filter: {
-                  name_contains: filter || "MSDN",
-                  offer_mapping: "MSDN",
-                },
-                enabled: true,
-                created_at: new Date().toISOString(),
-              }),
-            });
-            await load();
-            setMsg("Exclusion rule saved");
+            setBusy("save-rule");
+            setMsg("Saving exclusion rule…");
+            try {
+              await api("/scope/exclusion-rules", {
+                method: "POST",
+                body: JSON.stringify({
+                  id: "",
+                  name: `Exclude ${filter || "MSDN"}`,
+                  tenant_id: null,
+                  filter: {
+                    name_contains: filter || "MSDN",
+                    offer_mapping: "MSDN",
+                  },
+                  enabled: true,
+                  created_at: new Date().toISOString(),
+                }),
+              });
+              await load();
+              setMsg("Exclusion rule saved.");
+            } catch (e: unknown) {
+              setMsg(`Could not save exclusion rule: ${e instanceof Error ? e.message : String(e)}`);
+            } finally {
+              setBusy("");
+            }
           }}
         >
-          Save exclusion rule
+          {busy === "save-rule" ? "Saving…" : "Save exclusion rule"}
         </button>
       </div>
       {msg && <div className="muted">{msg}</div>}
@@ -118,36 +188,20 @@ export default function Scope() {
               <td>
                 <button
                   onClick={async () => {
-                    await api("/scope/decision", {
-                      method: "POST",
-                      body: JSON.stringify({
-                        tenant_id: r.subscription.tenant_id,
-                        subscription_id: r.subscription.id,
-                        decision: "track",
-                        reason: "explicit track",
-                      }),
-                    });
-                    await load();
+                    setSubscriptionDecision(r, "track");
                   }}
+                  disabled={busy.startsWith("track:")}
                 >
-                  Track
+                  {busy.startsWith("track:") ? "Tracking…" : "Track"}
                 </button>{" "}
                 <button
                   className="secondary"
                   onClick={async () => {
-                    await api("/scope/decision", {
-                      method: "POST",
-                      body: JSON.stringify({
-                        tenant_id: r.subscription.tenant_id,
-                        subscription_id: r.subscription.id,
-                        decision: "exclude",
-                        reason: "explicit exclude",
-                      }),
-                    });
-                    await load();
+                    setSubscriptionDecision(r, "exclude");
                   }}
+                  disabled={busy.startsWith("exclude:")}
                 >
-                  Exclude
+                  {busy.startsWith("exclude:") ? "Excluding…" : "Exclude"}
                 </button>
               </td>
             </tr>

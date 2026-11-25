@@ -2,16 +2,69 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, InboxResponse, InboxRow } from "../api";
 
+interface SubscriptionOption {
+  subscription: {
+    id: string;
+    name: string;
+    tenant_id: string;
+    state: string;
+  };
+  decision: string;
+}
+
+interface DiscoveredSubscription {
+  id: string;
+  name: string;
+  tenant_id: string;
+  state: string;
+}
+
 export default function Inbox() {
   const [rows, setRows] = useState<InboxRow[]>([]);
   const [env, setEnv] = useState("prod");
   const [severity, setSeverity] = useState("");
-  const [subscriptionId, setSubscriptionId] = useState("");
+  const [subscriptionId, setSubscriptionId] = useState(
+    () => localStorage.getItem("estatetrace.subscription_id") || "",
+  );
+  const [subscriptions, setSubscriptions] = useState<DiscoveredSubscription[]>([]);
   const [lastVisit, setLastVisit] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [ask, setAsk] = useState("");
   const [answer, setAnswer] = useState<unknown>(null);
   const [askBusy, setAskBusy] = useState(false);
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  const [scanBusy, setScanBusy] = useState(false);
+  const [actionMsg, setActionMsg] = useState("");
+
+  async function loadSubscriptions() {
+    const data = await api<{ subscriptions: DiscoveredSubscription[] }>("/subscriptions");
+    setSubscriptions(data.subscriptions || []);
+  }
+
+  async function refreshSubscriptions() {
+    setRefreshBusy(true);
+    setActionMsg("Discovering Azure subscriptions…");
+    try {
+      const result = await api<{ tenants: number; subscriptions: number }>(
+        "/azure/refresh",
+        {
+          method: "POST",
+          body: "{}",
+        },
+      );
+      await loadSubscriptions();
+      setActionMsg(
+        `Found ${result.subscriptions} subscription(s) in ${result.tenants} tenant(s).`,
+      );
+      setError("");
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setActionMsg("");
+      setError(`Azure discovery failed: ${message}`);
+    } finally {
+      setRefreshBusy(false);
+    }
+  }
 
   async function load() {
     try {
@@ -30,6 +83,18 @@ export default function Inbox() {
       setError(e instanceof Error ? e.message : String(e));
     }
   }
+
+  useEffect(() => {
+    loadSubscriptions();
+  }, []);
+
+  useEffect(() => {
+    if (subscriptionId) {
+      localStorage.setItem("estatetrace.subscription_id", subscriptionId);
+    } else {
+      localStorage.removeItem("estatetrace.subscription_id");
+    }
+  }, [subscriptionId]);
 
   useEffect(() => {
     load();
@@ -61,6 +126,40 @@ export default function Inbox() {
     }
   }
 
+  async function runScan() {
+    setScanBusy(true);
+    setActionMsg("Starting scan…");
+    try {
+      await api("/scan", {
+        method: "POST",
+        body: JSON.stringify(
+          subscriptionId
+            ? { subscription_ids: [subscriptionId] }
+            : { subscription_ids: null },
+        ),
+      });
+      setActionMsg(
+        subscriptionId
+          ? "Selected subscription scan started."
+          : "Azure scan started.",
+      );
+      window.setTimeout(() => {
+        load();
+        setActionMsg(
+          subscriptionId
+            ? "Selected subscription scan completed or is still updating."
+            : "Azure scan completed or is still updating.",
+        );
+      }, 3000);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setActionMsg("");
+      setError(`Scan failed to start: ${message}`);
+    } finally {
+      setScanBusy(false);
+    }
+  }
+
   return (
     <div>
       <div className="toolbar">
@@ -86,22 +185,41 @@ export default function Inbox() {
           </select>
         </label>
         <label>
-          Subscription ID
-          <input
-            placeholder="Paste subscription GUID"
+          Subscription
+          <select
             value={subscriptionId}
             onChange={(e) => setSubscriptionId(e.target.value)}
-          />
+          >
+            <option value="">All subscriptions</option>
+            {subscriptions
+              .filter((sub) => sub.state !== "Disabled")
+              .map((sub) => (
+                <option key={sub.id} value={sub.id}>
+                  {sub.name}
+                </option>
+              ))}
+          </select>
         </label>
-        <button onClick={load}>Refresh</button>
         <button
           className="secondary"
-          onClick={async () => {
-            await api("/scan", { method: "POST", body: "{}" });
-            setTimeout(load, 1500);
-          }}
+          onClick={refreshSubscriptions}
+          disabled={refreshBusy}
         >
-          Run scan
+          {refreshBusy ? "Refreshing Azure…" : "Refresh Azure subscriptions"}
+        </button>
+        <button onClick={load} disabled={scanBusy || refreshBusy}>
+          Refresh inbox
+        </button>
+        <button
+          className="secondary"
+          onClick={runScan}
+          disabled={scanBusy || refreshBusy}
+        >
+          {scanBusy
+            ? "Starting scan…"
+            : subscriptionId
+            ? "Scan selected subscription"
+            : "Run scan"}
         </button>
       </div>
 
@@ -112,6 +230,7 @@ export default function Inbox() {
       </div>
 
       {error && <div className="panel">{error}</div>}
+      {actionMsg && <div className="panel muted">{actionMsg}</div>}
 
       <table>
         <thead>

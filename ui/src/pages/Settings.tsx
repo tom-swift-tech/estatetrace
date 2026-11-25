@@ -20,6 +20,8 @@ export default function Settings() {
   const [msg, setMsg] = useState("");
   const [ask, setAsk] = useState("");
   const [answer, setAnswer] = useState<any>(null);
+  const [snowBusy, setSnowBusy] = useState(false);
+  const [chatBusy, setChatBusy] = useState(false);
 
   useEffect(() => {
     api("/connectors/status").then(setStatus);
@@ -53,26 +55,35 @@ export default function Settings() {
         <div className="toolbar">
           <button
             onClick={async () => {
-              const r = await api("/connectors/servicenow/test", {
-                method: "POST",
-                body: JSON.stringify({
-                  config: {
-                    instance_url: snow.instance_url,
-                    username: snow.username,
-                    operating_scope_services: [],
-                    operating_scope_assignment_groups: [],
-                    high_priorities: ["1", "2"],
-                    ongoing_incident_states: ["1", "2", "3"],
-                    refresh_interval_minutes: 5,
-                  },
-                  password: snow.password,
-                }),
-              });
-              setMsg(JSON.stringify(r));
-              setStatus(await api("/connectors/status"));
+              setSnowBusy(true);
+              setMsg("Testing ServiceNow connection…");
+              try {
+                const r = await api("/connectors/servicenow/test", {
+                  method: "POST",
+                  body: JSON.stringify({
+                    config: {
+                      instance_url: snow.instance_url,
+                      username: snow.username,
+                      operating_scope_services: [],
+                      operating_scope_assignment_groups: [],
+                      high_priorities: ["1", "2"],
+                      ongoing_incident_states: ["1", "2", "3"],
+                      refresh_interval_minutes: 5,
+                    },
+                    password: snow.password,
+                  }),
+                });
+                setMsg(`ServiceNow connected and saved. ${JSON.stringify(r)}`);
+                setStatus(await api("/connectors/status"));
+              } catch (e: unknown) {
+                setMsg(`ServiceNow test failed: ${e instanceof Error ? e.message : String(e)}`);
+              } finally {
+                setSnowBusy(false);
+              }
             }}
+            disabled={snowBusy}
           >
-            Test and save
+            {snowBusy ? "Testing..." : "Test and save"}
           </button>
           <button
             className="secondary"
@@ -110,23 +121,32 @@ export default function Settings() {
         <div className="toolbar">
           <button
             onClick={async () => {
-              const r = await api("/connectors/chat/test", {
-                method: "POST",
-                body: JSON.stringify({
-                  config: {
-                    gateway_url: chat.gateway_url,
-                    deployment: chat.deployment,
-                    header_name: chat.header_name,
-                    api_version: "2024-02-15-preview",
-                  },
-                  key: chat.key,
-                }),
-              });
-              setMsg(JSON.stringify(r));
-              setStatus(await api("/connectors/status"));
+              setChatBusy(true);
+              setMsg("Testing APIM chat connection…");
+              try {
+                const r = await api("/connectors/chat/test", {
+                  method: "POST",
+                  body: JSON.stringify({
+                    config: {
+                      gateway_url: chat.gateway_url,
+                      deployment: chat.deployment,
+                      header_name: chat.header_name,
+                      api_version: "2024-02-15-preview",
+                    },
+                    key: chat.key,
+                  }),
+                });
+                setMsg(`APIM chat connected and saved. ${JSON.stringify(r)}`);
+                setStatus(await api("/connectors/status"));
+              } catch (e: unknown) {
+                setMsg(`APIM chat test failed: ${e instanceof Error ? e.message : String(e)}`);
+              } finally {
+                setChatBusy(false);
+              }
             }}
+            disabled={chatBusy}
           >
-            Test and save
+            {chatBusy ? "Testing..." : "Test and save"}
           </button>
           <button
             className="secondary"

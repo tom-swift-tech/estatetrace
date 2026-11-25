@@ -17,8 +17,24 @@ use tokio::process::Command;
 use tracing::warn;
 
 pub async fn az_json<T: DeserializeOwned>(args: &[&str]) -> Result<T> {
-    let output = Command::new("az")
-        .args(args)
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("cmd.exe");
+        command.arg("/D").arg("/S").arg("/C");
+        command.arg("az.cmd");
+        for arg in args {
+            command.arg(arg);
+        }
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new("az");
+        command.args(args);
+        command
+    };
+
+    let output = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()

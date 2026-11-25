@@ -31,6 +31,7 @@ pub fn router(state: AppState) -> Router {
         .route("/session", get(session))
         .route("/azure/refresh", post(azure_refresh))
         .route("/scope", get(get_scope))
+        .route("/subscriptions", get(list_subscriptions))
         .route("/scope/decision", post(set_decision))
         .route("/scope/exclusion-rules", get(list_rules).post(save_rule))
         .route("/scope/exclusion-preview", post(preview_exclusion))
@@ -154,7 +155,10 @@ async fn azure_refresh(
     require_mutation(&state, &headers)?;
     let (tenants, subs) = discover_tenants_and_subscriptions()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| {
+            tracing::error!("Azure discovery failed: {e:#}");
+            StatusCode::BAD_GATEWAY
+        })?;
     for t in &tenants {
         db::upsert_tenant(&state.pool, t)
             .await
@@ -180,6 +184,17 @@ async fn get_scope(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "rows": rows })))
+}
+
+async fn list_subscriptions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
+    let subscriptions = db::list_subscriptions(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "subscriptions": subscriptions })))
 }
 
 #[derive(Deserialize)]
@@ -305,15 +320,28 @@ async fn suggestions(
     Ok(Json(json!({ "offers": suggested_offer_searches() })))
 }
 
+#[derive(Deserialize, Default)]
+struct ScanReq {
+    subscription_ids: Option<Vec<String>>,
+}
+
 async fn trigger_scan(
     State(state): State<AppState>,
     headers: HeaderMap,
+    body: Option<Json<ScanReq>>,
 ) -> Result<Json<Value>, StatusCode> {
     require_mutation(&state, &headers)?;
+    let subscription_ids = body
+        .and_then(|Json(req)| req.subscription_ids)
+        .filter(|ids| !ids.is_empty());
     tokio::spawn({
         let state = state.clone();
         async move {
-            if let Err(e) = scan::run_scan(&state).await {
+            let result = match subscription_ids.as_deref() {
+                Some(ids) => scan::run_scan_for(&state, Some(ids)).await,
+                None => scan::run_scan(&state).await,
+            };
+            if let Err(e) = result {
                 tracing::error!("scan error: {e}");
             }
         }
@@ -1096,11 +1124,11 @@ async fn snow_test(
     Json(req): Json<SnowTestReq>,
 ) -> Result<Json<Value>, StatusCode> {
     require_mutation(&state, &headers)?;
-    ServiceNowClient::save_credentials(&req.config, &req.password)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let client = ServiceNowClient::connect(req.config.clone(), req.password);
+    let client = ServiceNowClient::connect(req.config.clone(), req.password.clone());
     match client.test_access().await {
         Ok(detail) => {
+            ServiceNowClient::save_credentials(&req.config, &req.password)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             db::set_connector_status(&state.pool, "servicenow", true, Some(true), &detail)
                 .await
                 .ok();
@@ -1120,7 +1148,7 @@ async fn snow_test(
             )
             .await
             .ok();
-            Ok(Json(json!({ "ok": false, "error": e.to_string() })))
+            Err(StatusCode::BAD_GATEWAY)
         }
     }
 }

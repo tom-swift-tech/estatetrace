@@ -8,6 +8,10 @@ use std::collections::HashSet;
 use tracing::{info, warn};
 
 pub async fn run_scan(state: &AppState) -> Result<()> {
+    run_scan_for(state, None).await
+}
+
+pub async fn run_scan_for(state: &AppState, subscription_ids: Option<&[String]>) -> Result<()> {
     let _guard = state.scan_lock.lock().await;
     let scan_id = db::create_scan_run(&state.pool, "azure_resource_graph").await?;
     info!("starting scan {scan_id}");
@@ -16,6 +20,11 @@ pub async fn run_scan(state: &AppState) -> Result<()> {
     let tracked: Vec<_> = scope
         .into_iter()
         .filter(|r| r.decision == DecisionKind::Track)
+        .filter(|r| {
+            subscription_ids
+                .map(|ids| ids.iter().any(|id| id == r.subscription.id.as_str()))
+                .unwrap_or(true)
+        })
         .collect();
 
     if tracked.is_empty() {
