@@ -44,6 +44,7 @@ pub fn router(state: AppState) -> Router {
         .route("/changes", get(list_changes))
         .route("/coverage", get(coverage))
         .route("/inbox", get(inbox))
+        .route("/findings", get(list_findings_api))
         .route("/compliance", get(compliance_summary))
         .route("/exceptions", get(list_exceptions_api).post(create_exception))
         .route("/dispositions", get(list_dispositions_api).post(create_disposition))
@@ -52,6 +53,8 @@ pub fn router(state: AppState) -> Router {
         .route("/classification/quality", get(classification_quality))
         .route("/packs", get(list_packs).post(import_pack))
         .route("/packs/pilot", post(load_pilot))
+        .route("/packs/{id}/activate", post(activate_pack))
+        .route("/packs/{id}/deactivate", post(deactivate_pack))
         .route("/packs/validate", post(validate_pack))
         .route("/packs/compile", post(compile_pack))
         .route("/exports/preview", post(export_preview))
@@ -392,12 +395,15 @@ async fn resource_timeline(
     let changes = db::list_changes_for_resource(&state.pool, &decoded)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let evals = db::list_evaluations(&state.pool, 500)
+    let tracked = db::tracked_subscription_ids(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let evals: Vec<_> = evals
+    // Full interval history (open + closed), scope-filtered (invariant 13). No LIMIT.
+    let findings: Vec<FindingInterval> = db::findings_for_resource(&state.pool, &decoded)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .into_iter()
-        .filter(|e| e.resource_id.as_str() == decoded)
+        .filter(|f| in_scope(&tracked, f.subscription_id.as_str()))
         .collect();
     let tickets = db::list_ticket_relationships(&state.pool, &decoded)
         .await
@@ -409,22 +415,103 @@ async fn resource_timeline(
     let exceptions = db::list_exceptions(&state.pool, None, Some(&decoded))
         .await
         .unwrap_or_default();
-    let triage = triage_with_exceptions(&evals, &exceptions, now);
+    // Triage per (resource, control): one entry per open interval, null for closed ones.
+    let findings_triage: Vec<Option<TriageInfo>> = findings
+        .iter()
+        .map(|f| f.is_open().then(|| triage_interval(f, &exceptions, now)))
+        .collect();
+    let triage = findings_triage
+        .iter()
+        .flatten()
+        .min_by_key(|t| triage_rank(&t.state))
+        .cloned();
     let mut dispositions = Vec::new();
-    for e in &evals {
-        if let Ok(Some(d)) = db::latest_disposition_for_evaluation(&state.pool, &e.id).await {
+    for f in findings.iter().filter(|f| f.is_open()) {
+        if let Ok(Some(d)) = db::latest_disposition_for_evaluation(&state.pool, &f.id).await {
             dispositions.push(d);
         }
     }
+    let last_scan_at = db::last_finished_scan_started_at(&state.pool).await.ok().flatten();
     Ok(Json(json!({
         "resource": obs,
         "changes": changes,
-        "evaluations": evals,
+        "findings": findings,
+        "findings_triage": findings_triage,
         "triage": triage,
+        "last_scan_at": last_scan_at,
         "exceptions": exceptions,
         "dispositions": dispositions,
         "tickets": tickets,
         "coverage": coverage,
+    })))
+}
+
+/// Case-insensitive membership in the tracked subscription list (invariant 13).
+fn in_scope(tracked: &[String], subscription_id: &str) -> bool {
+    tracked.iter().any(|t| t.eq_ignore_ascii_case(subscription_id))
+}
+
+/// Triage each open interval on its own (invariant 10), most urgent first.
+fn triage_findings(
+    findings: Vec<FindingInterval>,
+    exceptions: &[ExceptionRecord],
+    now: DateTime<Utc>,
+) -> Vec<(FindingInterval, TriageInfo)> {
+    let mut out: Vec<(FindingInterval, TriageInfo)> = findings
+        .into_iter()
+        .map(|f| {
+            let t = triage_interval(&f, exceptions, now);
+            (f, t)
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        triage_rank(&a.1.state)
+            .cmp(&triage_rank(&b.1.state))
+            .then_with(|| a.0.control_id.cmp(&b.0.control_id))
+            .then_with(|| a.0.pack_id.cmp(&b.0.pack_id))
+    });
+    out
+}
+
+/// `GET /api/findings` (spec §3.4): open intervals matching the query, or the full history
+/// of `resource_id` when given (AC-P3-8). Always limited to tracked subscriptions.
+/// Response: `{ findings, triage, last_scan_at }`, `triage[i]` belonging to `findings[i]`.
+async fn list_findings_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(mut q): Query<FindingQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    require_session(&state, &headers)?;
+    let tracked = db::tracked_subscription_ids(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let findings: Vec<FindingInterval> = match q.resource_id.as_deref() {
+        Some(rid) => db::findings_for_resource(&state.pool, rid)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .into_iter()
+            .filter(|f| in_scope(&tracked, f.subscription_id.as_str()))
+            .collect(),
+        None => {
+            q.subscriptions = Some(tracked);
+            db::list_open_findings(&state.pool, &q)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        }
+    };
+    let exceptions = db::list_exceptions(&state.pool, None, None)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let now = Utc::now();
+    let triage: Vec<TriageInfo> = findings
+        .iter()
+        .map(|f| triage_interval(f, &exceptions, now))
+        .collect();
+    let last_scan_at = db::last_finished_scan_started_at(&state.pool).await.ok().flatten();
+    Ok(Json(json!({
+        "findings": findings,
+        "triage": triage,
+        "last_scan_at": last_scan_at,
     })))
 }
 
@@ -476,12 +563,47 @@ async fn inbox(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let ctx = ClassCtx::load(&state).await;
-    let evals = db::list_evaluations(&state.pool, 1000)
-        .await
-        .unwrap_or_default();
+    let changes: Vec<ChangeEvent> = changes
+        .into_iter()
+        .filter(|ch| tracked.iter().any(|t| t == ch.subscription_id.as_str()))
+        .filter(|ch| {
+            q.subscription_id
+                .as_deref()
+                .map(|sid| ch.subscription_id.as_str() == sid)
+                .unwrap_or(true)
+        })
+        .collect();
+    // One query for the open findings of every resource in view (no global LIMIT), grouped
+    // by resource. Triage is per (resource, control): a pass on one control never masks a
+    // fail on another (AC-P3-7).
+    let resource_ids: Vec<String> = changes
+        .iter()
+        .map(|c| c.resource_id.as_str().to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let open = db::list_open_findings(
+        &state.pool,
+        &FindingQuery {
+            subscriptions: Some(tracked.clone()),
+            resource_ids: Some(resource_ids),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut by_resource: std::collections::HashMap<String, Vec<FindingInterval>> =
+        std::collections::HashMap::new();
+    for f in open {
+        by_resource
+            .entry(f.resource_id.as_str().to_string())
+            .or_default()
+            .push(f);
+    }
     let exceptions = db::list_exceptions(&state.pool, None, None)
         .await
         .unwrap_or_default();
+    let last_scan_at = db::last_finished_scan_started_at(&state.pool).await.ok().flatten();
 
     let last_visit = db::meta_get(&state.pool, "last_visit")
         .await
@@ -496,14 +618,6 @@ async fn inbox(
 
     let mut rows = Vec::new();
     for ch in changes {
-        if !tracked.iter().any(|t| t == ch.subscription_id.as_str()) {
-            continue;
-        }
-        if let Some(ref sid) = q.subscription_id {
-            if ch.subscription_id.as_str() != sid {
-                continue;
-            }
-        }
         let obs = db::latest_observation(&state.pool, ch.resource_id.as_str())
             .await
             .ok()
@@ -523,37 +637,41 @@ async fn inbox(
         }
         let group_key =
             inbox_group_key(q.group_by.as_deref(), &ownership, &ctx, ch.subscription_id.as_str());
-        let resource_evals: Vec<_> = evals
-            .iter()
-            .filter(|e| e.resource_id == ch.resource_id)
+        let resource_findings = by_resource
+            .get(ch.resource_id.as_str())
             .cloned()
-            .collect();
-        let related_eval = resource_evals.first().cloned();
+            .unwrap_or_default();
         if let Some(ref sev) = q.severity {
-            if related_eval
-                .as_ref()
-                .map(|e| e.severity.as_str() != sev)
-                .unwrap_or(true)
-            {
+            if !resource_findings.iter().any(|f| f.severity.as_str() == sev) {
                 continue;
             }
         }
-        let triage = triage_with_exceptions(&resource_evals, &exceptions, now);
-        let disposition = if let Some(ref ev) = related_eval {
-            db::latest_disposition_for_evaluation(&state.pool, &ev.id)
+        let triaged = triage_findings(resource_findings, &exceptions, now);
+        // Row-level summary is the most urgent control; every control is listed in `findings`.
+        let (finding, triage) = match triaged.first() {
+            Some((f, t)) => (Some(f.clone()), Some(t.clone())),
+            None => (None, None),
+        };
+        let disposition = if let Some(ref f) = finding {
+            db::latest_disposition_for_evaluation(&state.pool, &f.id)
                 .await
                 .ok()
                 .flatten()
         } else {
             None
         };
+        let findings: Vec<Value> = triaged
+            .iter()
+            .map(|(f, t)| json!({ "finding": f, "triage": t }))
+            .collect();
         let since_last_visit = last_visit_dt
             .map(|lv| ch.times.observation_time > lv)
             .unwrap_or(true);
         rows.push(json!({
             "change": ch,
             "classification": class,
-            "evaluation": related_eval,
+            "finding": finding,
+            "findings": findings,
             "triage": triage,
             "disposition": disposition,
             "resource": obs,
@@ -574,8 +692,9 @@ async fn inbox(
                 "actionable" => 0,
                 "awaiting_grace" => 1,
                 "fail" | "unknown" => 2,
-                "verified_corrected" => 3,
-                _ => 4,
+                "excepted" => 3,
+                "verified_corrected" => 4,
+                _ => 5,
             }
         };
         let cmp = rank(a).cmp(&rank(b));
@@ -601,6 +720,7 @@ async fn inbox(
         "rows": rows,
         "groups": groups,
         "last_visit": last_visit,
+        "last_scan_at": last_scan_at,
         "filter": q,
     })))
 }
@@ -610,19 +730,36 @@ async fn compliance_summary(
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
     require_session(&state, &headers)?;
-    let evals = db::list_evaluations(&state.pool, 5000)
+    let tracked = db::tracked_subscription_ids(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Every open interval in scope: the current state, never truncated by a LIMIT.
+    let open = db::list_open_findings(
+        &state.pool,
+        &FindingQuery {
+            subscriptions: Some(tracked.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let last_scan_at = db::last_finished_scan_started_at(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut pass = 0;
     let mut fail = 0;
     let mut unknown = 0;
     let mut inapplicable = 0;
-    for e in &evals {
-        match e.outcome {
+    let mut stale = 0;
+    for f in &open {
+        match f.outcome {
             EvalOutcome::Pass => pass += 1,
             EvalOutcome::Fail => fail += 1,
             EvalOutcome::Unknown => unknown += 1,
             EvalOutcome::Inapplicable => inapplicable += 1,
+        }
+        if last_scan_at.is_some_and(|t| f.last_evaluated_at < t) {
+            stale += 1;
         }
     }
     let now = Utc::now();
@@ -633,24 +770,14 @@ async fn compliance_summary(
     let mut awaiting_grace = 0;
     let mut verified = 0;
     let mut excepted = 0;
-    // Group by resource+control for triage history
-    let mut by_key: std::collections::HashMap<(String, String), Vec<Evaluation>> =
-        std::collections::HashMap::new();
-    for e in &evals {
-        by_key
-            .entry((e.resource_id.as_str().to_string(), e.control_id.clone()))
-            .or_default()
-            .push(e.clone());
-    }
-    for (_k, hist) in &by_key {
-        if let Some(info) = triage_with_exceptions(hist, &exception_rows, now) {
-            match info.state {
-                TriageState::Actionable => actionable += 1,
-                TriageState::AwaitingGrace => awaiting_grace += 1,
-                TriageState::VerifiedCorrected => verified += 1,
-                TriageState::Excepted => excepted += 1,
-                _ => {}
-            }
+    // One triage per open interval, i.e. per (pack, resource, control).
+    for f in &open {
+        match triage_interval(f, &exception_rows, now).state {
+            TriageState::Actionable => actionable += 1,
+            TriageState::AwaitingGrace => awaiting_grace += 1,
+            TriageState::VerifiedCorrected => verified += 1,
+            TriageState::Excepted => excepted += 1,
+            _ => {}
         }
     }
     let exceptions = exception_rows.iter().filter(|x| x.is_active(now)).count();
@@ -692,7 +819,9 @@ async fn compliance_summary(
         "awaiting_grace": awaiting_grace,
         "verified_corrected": verified,
         "freshness": now,
-        "scope": db::tracked_subscription_ids(&state.pool).await.unwrap_or_default(),
+        "last_scan_at": last_scan_at,
+        "stale": stale,
+        "scope": tracked,
         "coverage_gaps": coverage_gaps,
         "controls_evaluated": controls_evaluated,
         "controls_total": controls_total,
@@ -1174,6 +1303,11 @@ async fn import_pack(
     )
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if req.activate {
+        activate_revision(&state, &pack.id, &pack.revision)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
 
     // Persist pack file privately
     let path = state
@@ -1212,12 +1346,72 @@ async fn load_pilot(
     )
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    activate_revision(&state, &pack.id, &pack.revision)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({
         "id": pack.id,
         "revision": pack.revision,
         "coverage": coverage_report(&pack),
         "examples": run_example_cases(&pack, builtin_resource_kinds()).unwrap_or_default(),
     })))
+}
+
+/// Make `revision` the pack's only active revision. When a different revision was active,
+/// its open findings close with `pack_revision` (spec invariant 8, AC-P3-3). Returns the
+/// number of intervals closed.
+async fn activate_revision(state: &AppState, pack_id: &str, revision: &str) -> anyhow::Result<u64> {
+    let before = db::set_pack_active_revision(&state.pool, pack_id, Some(revision)).await?;
+    if before.iter().any(|r| r != revision) {
+        return db::close_findings_for_pack(&state.pool, pack_id, CloseReason::PackRevision).await;
+    }
+    Ok(0)
+}
+
+#[derive(Deserialize)]
+struct ActivatePackReq {
+    revision: String,
+}
+
+/// `POST /api/packs/{id}/activate {revision}`: switch the active revision of a stored pack.
+async fn activate_pack(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<ActivatePackReq>,
+) -> Result<Json<Value>, StatusCode> {
+    require_mutation(&state, &headers)?;
+    let id = urlencoding_decode(&id);
+    let exists = db::list_policy_packs(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .iter()
+        .any(|p| p["id"] == id.as_str() && p["revision"] == req.revision.as_str());
+    if !exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let closed = activate_revision(&state, &id, &req.revision)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "id": id, "revision": req.revision, "activated": true, "closed": closed })))
+}
+
+/// `POST /api/packs/{id}/deactivate`: deactivate every revision and close the pack's open
+/// findings with `pack_deactivated` (AC-P3-9).
+async fn deactivate_pack(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    require_mutation(&state, &headers)?;
+    let id = urlencoding_decode(&id);
+    db::set_pack_active_revision(&state.pool, &id, None)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let closed = db::close_findings_for_pack(&state.pool, &id, CloseReason::PackDeactivated)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "id": id, "activated": false, "closed": closed })))
 }
 
 async fn validate_pack(
@@ -1870,9 +2064,24 @@ async fn chat_ask(
     let resources = db::list_latest_resources(&state.pool)
         .await
         .unwrap_or_default();
-    let evals = db::list_evaluations(&state.pool, 2000)
-        .await
-        .unwrap_or_default();
+    // Open findings in scope, grouped by resource (no global LIMIT).
+    let mut findings_by_resource: std::collections::HashMap<String, Vec<FindingInterval>> =
+        std::collections::HashMap::new();
+    for f in db::list_open_findings(
+        &state.pool,
+        &FindingQuery {
+            subscriptions: Some(tracked.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_or_default()
+    {
+        findings_by_resource
+            .entry(f.resource_id.as_str().to_string())
+            .or_default()
+            .push(f);
+    }
     let mut gaps = Vec::new();
     let mut records = Vec::new();
     for r in resources {
@@ -1890,12 +2099,28 @@ async fn chat_ask(
                 continue;
             }
         }
-        let related = evals.iter().find(|e| e.resource_id == r.resource_id);
+        let resource_findings = findings_by_resource
+            .get(r.resource_id.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         if let Some(ref sev) = req.severity {
-            if related.map(|e| e.severity.as_str() != sev).unwrap_or(true) {
+            if !resource_findings.iter().any(|f| f.severity.as_str() == sev) {
                 continue;
             }
         }
+        // Worst outcome across the resource's controls (fail > unknown > pass > inapplicable).
+        let outcome_rank = |o: &EvalOutcome| match o {
+            EvalOutcome::Fail => 0,
+            EvalOutcome::Unknown => 1,
+            EvalOutcome::Pass => 2,
+            EvalOutcome::Inapplicable => 3,
+        };
+        let related = resource_findings.iter().min_by_key(|f| outcome_rank(&f.outcome));
+        let failing_controls: Vec<&str> = resource_findings
+            .iter()
+            .filter(|f| f.outcome == EvalOutcome::Fail)
+            .map(|f| f.control_id.as_str())
+            .collect();
         let tickets = db::list_ticket_relationships(&state.pool, r.resource_id.as_str())
             .await
             .unwrap_or_default();
@@ -1908,8 +2133,9 @@ async fn chat_ask(
             "subscription_id": r.subscription_id,
             "observation_time": r.observation_time,
             "environment": class.environment,
-            "compliance": related.map(|e| e.outcome.as_str()),
-            "severity": related.map(|e| e.severity.as_str()),
+            "compliance": related.map(|f| f.outcome.as_str()),
+            "severity": related.map(|f| f.severity.as_str()),
+            "failing_controls": failing_controls,
             "ticket_number": tickets.first().and_then(|t| t.get("record_number").cloned()),
             "ticket_state": tickets.first().and_then(|t| t.get("lookup_status").cloned()),
         }));
@@ -1994,19 +2220,22 @@ async fn evidence_export(
     let changes = db::list_changes_for_resource(&state.pool, resource_id)
         .await
         .unwrap_or_default();
-    let evals = db::list_evaluations(&state.pool, 100)
+    let tracked = db::tracked_subscription_ids(&state.pool)
+        .await
+        .unwrap_or_default();
+    let findings: Vec<FindingInterval> = db::findings_for_resource(&state.pool, resource_id)
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter(|e| e.resource_id.as_str() == resource_id)
-        .collect::<Vec<_>>();
+        .filter(|f| in_scope(&tracked, f.subscription_id.as_str()))
+        .collect();
     let tickets = db::list_ticket_relationships(&state.pool, resource_id)
         .await
         .unwrap_or_default();
     let payload = json!({
         "resource": obs,
         "changes": changes,
-        "evaluations": evals,
+        "findings": findings,
         "tickets": tickets,
         "filter_scope": body.get("filter_scope"),
         "exported_at": Utc::now(),
@@ -2951,5 +3180,373 @@ mod compile_api_tests {
             app.oneshot(bad_origin).await.unwrap().status(),
             StatusCode::FORBIDDEN
         );
+    }
+}
+
+/// Phase 3 API tests: readers use finding intervals, scoped and triaged per control.
+#[cfg(test)]
+mod findings_api_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use chrono::Duration;
+    use estatetrace_policy::PackEvaluation;
+    use http_body_util::BodyExt;
+    use std::collections::HashSet;
+    use tower::ServiceExt;
+
+    const TRACKED: &str = "sub-tracked";
+    const UNTRACKED: &str = "sub-untracked";
+
+    fn rid(sub: &str, name: &str) -> String {
+        format!("/subscriptions/{sub}/resourceGroups/rg-app/providers/Microsoft.Storage/storageAccounts/{name}")
+    }
+
+    fn ev(resource: &str, control: &str, outcome: EvalOutcome, at: DateTime<Utc>) -> Evaluation {
+        Evaluation {
+            id: format!("{resource}:{control}"),
+            observation_id: format!("obs-{resource}"),
+            resource_id: ResourceId::new(resource),
+            control_id: control.into(),
+            control_revision: "1".into(),
+            outcome,
+            severity: Severity::High,
+            evidence: json!({ "clause_revision": "1", "lane": "security" }),
+            evaluated_at: at,
+            environment: EnvironmentClass::Unknown,
+            detail: String::new(),
+        }
+    }
+
+    fn result(evaluations: Vec<Evaluation>) -> PackEvaluation {
+        PackEvaluation {
+            evaluations,
+            coverage_gaps: vec![],
+        }
+    }
+
+    async fn seeded() -> (axum::Router, String, AppState) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = AppState::bootstrap_in(dir.path().to_path_buf())
+            .await
+            .expect("bootstrap");
+        let _kept = dir.keep();
+        let pool = &state.pool;
+        db::upsert_tenant(
+            pool,
+            &TenantInfo {
+                id: TenantId::new("tenant-fabrikam"),
+                name: "Fabrikam".into(),
+                needs_sign_in: false,
+                last_refresh: Some(Utc::now()),
+                access_issue: None,
+            },
+        )
+        .await
+        .unwrap();
+        for (id, decision) in [(TRACKED, DecisionKind::Track), (UNTRACKED, DecisionKind::Exclude)] {
+            db::upsert_subscription(
+                pool,
+                &SubscriptionInfo {
+                    id: SubscriptionId::new(id),
+                    tenant_id: TenantId::new("tenant-fabrikam"),
+                    name: id.into(),
+                    state: "Enabled".into(),
+                    quota_id: None,
+                    tags: json!({}),
+                    access_issue: None,
+                    last_refresh: Some(Utc::now()),
+                },
+            )
+            .await
+            .unwrap();
+            db::insert_scope_decision(
+                pool,
+                &ScopeDecision {
+                    id: format!("decision-{id}"),
+                    provider: Provider::Azure,
+                    tenant_id: TenantId::new("tenant-fabrikam"),
+                    subscription_id: Some(SubscriptionId::new(id)),
+                    decision,
+                    source: DecisionSource::Explicit,
+                    matching_rule_id: None,
+                    reason: None,
+                    effective_from: Utc::now(),
+                    effective_to: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        for sub in [TRACKED, UNTRACKED] {
+            let r = rid(sub, "st1");
+            db::insert_observation(
+                pool,
+                &ResourceObservation {
+                    id: format!("obs-{r}"),
+                    provider: Provider::Azure,
+                    resource_id: ResourceId::new(r.clone()),
+                    tenant_id: TenantId::new("tenant-fabrikam"),
+                    subscription_id: SubscriptionId::new(sub),
+                    resource_type: "Microsoft.Storage/storageAccounts".into(),
+                    name: format!("st1-{sub}"),
+                    location: Some("eastus".into()),
+                    resource_group: Some("rg-app".into()),
+                    tags: json!({}),
+                    properties: json!({}),
+                    scan_id: "scan-1".into(),
+                    observation_time: Utc::now(),
+                    evidence_available: true,
+                    lifecycle_epoch: 1,
+                    arm_meta: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+            db::insert_change_event(
+                pool,
+                &ChangeEvent {
+                    id: format!("chg-{sub}"),
+                    resource_id: ResourceId::new(r.clone()),
+                    subscription_id: SubscriptionId::new(sub),
+                    source_event_id: Some(format!("test:{sub}")),
+                    label: ChangeLabel::Updated,
+                    times: DualTime::observed_now(),
+                    before: None,
+                    after: None,
+                    property_diffs: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // The tracked resource fails control A and passes control B; the untracked one
+        // fails A.
+        let at = Utc::now() - Duration::hours(1);
+        let tracked = rid(TRACKED, "st1");
+        db::save_policy_pack(pool, "PACK-1", "Pack", "1", None, Some("test"), true, &json!({}))
+            .await
+            .unwrap();
+        db::record_pack_evaluation(
+            pool,
+            "scan-1",
+            "PACK-1",
+            "1",
+            &HashSet::new(),
+            &result(vec![
+                ev(&tracked, "CTL-A", EvalOutcome::Fail, at),
+                ev(&tracked, "CTL-B", EvalOutcome::Pass, at),
+                ev(&rid(UNTRACKED, "st1"), "CTL-A", EvalOutcome::Fail, at),
+            ]),
+        )
+        .await
+        .unwrap();
+        let token = state.session_token.clone();
+        (router(state.clone()), token, state)
+    }
+
+    async fn call(
+        app: &axum::Router,
+        token: &str,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-session-token", token)
+            .header("origin", "http://127.0.0.1:8787");
+        let body = match body {
+            Some(b) => {
+                req = req.header("content-type", "application/json");
+                Body::from(b.to_string())
+            }
+            None => Body::empty(),
+        };
+        let res = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    fn enc(s: &str) -> String {
+        s.replace('/', "%2F")
+    }
+
+    #[tokio::test]
+    async fn ac_p3_7_inbox_triages_per_control_and_pass_does_not_mask_fail() {
+        let (app, token, _) = seeded().await;
+        let (s, inbox) = call(&app, &token, "GET", "/api/inbox", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let rows = inbox["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "untracked subscription is out of scope");
+        let row = &rows[0];
+        assert_eq!(row["triage"]["state"], "actionable", "{row}");
+        assert_eq!(row["finding"]["control_id"], "CTL-A");
+        let per_control: Vec<(String, String)> = row["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["finding"]["control_id"].as_str().unwrap().to_string(),
+                    f["triage"]["state"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            per_control,
+            vec![
+                ("CTL-A".to_string(), "actionable".to_string()),
+                ("CTL-B".to_string(), "pass".to_string())
+            ]
+        );
+        assert!(row.get("evaluation").is_none(), "legacy key removed");
+    }
+
+    #[tokio::test]
+    async fn findings_endpoint_is_scoped_and_returns_full_history() {
+        let (app, token, state) = seeded().await;
+        let (s, out) = call(&app, &token, "GET", "/api/findings", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(out["findings"].as_array().unwrap().len(), 2, "tracked subscription only");
+        assert_eq!(out["triage"].as_array().unwrap().len(), 2);
+        let (_, fails) = call(&app, &token, "GET", "/api/findings?outcome=fail", None).await;
+        assert_eq!(fails["findings"].as_array().unwrap().len(), 1);
+
+        // Fail -> pass on CTL-A: the history keeps both intervals (AC-P3-8 read shape).
+        let tracked = rid(TRACKED, "st1");
+        db::record_pack_evaluation(
+            &state.pool,
+            "scan-2",
+            "PACK-1",
+            "1",
+            &HashSet::new(),
+            &result(vec![ev(&tracked, "CTL-A", EvalOutcome::Pass, Utc::now())]),
+        )
+        .await
+        .unwrap();
+        let uri = format!("/api/findings?resource_id={}", enc(&tracked));
+        let (_, hist) = call(&app, &token, "GET", &uri, None).await;
+        let hist = hist["findings"].as_array().unwrap();
+        assert_eq!(hist.len(), 3);
+        assert!(hist.iter().any(|f| f["close_reason"] == "state_changed"));
+
+        let uri = format!("/api/resources/{}/timeline", enc(&tracked));
+        let (_, timeline) = call(&app, &token, "GET", &uri, None).await;
+        let tl_findings = timeline["findings"].as_array().unwrap();
+        assert_eq!(tl_findings.len(), 3);
+        assert!(timeline.get("evaluations").is_none());
+        let triage = timeline["findings_triage"].as_array().unwrap();
+        assert_eq!(triage.len(), 3);
+        let a_open = tl_findings
+            .iter()
+            .position(|f| f["control_id"] == "CTL-A" && f["closed_at"].is_null())
+            .unwrap();
+        assert_eq!(triage[a_open]["state"], "verified_corrected");
+        let a_closed = tl_findings
+            .iter()
+            .position(|f| f["control_id"] == "CTL-A" && !f["closed_at"].is_null())
+            .unwrap();
+        assert!(triage[a_closed].is_null(), "closed intervals carry no triage");
+
+        // Out-of-scope history is hidden.
+        let uri = format!("/api/findings?resource_id={}", enc(&rid(UNTRACKED, "st1")));
+        let (_, hidden) = call(&app, &token, "GET", &uri, None).await;
+        assert!(hidden["findings"].as_array().unwrap().is_empty());
+
+        let (_, summary) = call(&app, &token, "GET", "/api/compliance", None).await;
+        assert_eq!(summary["passing"], 2);
+        assert_eq!(summary["failing"], 0, "untracked fail is out of scope");
+        assert_eq!(summary["verified_corrected"], 1);
+
+        let (s, export) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/evidence/export",
+            Some(json!({ "resource_id": tracked })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(export["findings"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn ac_p3_9_pack_revision_activation_and_deactivation_close_findings() {
+        let (app, token, state) = seeded().await;
+        let tracked = rid(TRACKED, "st1");
+        db::save_policy_pack(&state.pool, "PACK-1", "Pack", "2", None, Some("test"), false, &json!({}))
+            .await
+            .unwrap();
+        let (s, _) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/packs/PACK-1/activate",
+            Some(json!({ "revision": "9" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, out) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/packs/PACK-1/activate",
+            Some(json!({ "revision": "2" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{out}");
+        assert_eq!(out["closed"], 3);
+        let hist = db::findings_for_resource(&state.pool, &tracked).await.unwrap();
+        assert!(hist.iter().all(|f| f.close_reason == Some(CloseReason::PackRevision)));
+        let active = db::active_policy_packs(&state.pool).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0]["revision"], "2");
+
+        // Re-activating the active revision closes nothing.
+        db::record_pack_evaluation(
+            &state.pool,
+            "scan-2",
+            "PACK-1",
+            "2",
+            &HashSet::new(),
+            &result(vec![ev(&tracked, "CTL-A", EvalOutcome::Fail, Utc::now())]),
+        )
+        .await
+        .unwrap();
+        let (_, out) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/packs/PACK-1/activate",
+            Some(json!({ "revision": "2" })),
+        )
+        .await;
+        assert_eq!(out["closed"], 0);
+
+        let (s, out) = call(&app, &token, "POST", "/api/packs/PACK-1/deactivate", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(out["closed"], 1);
+        assert!(db::list_open_findings(&state.pool, &FindingQuery::default())
+            .await
+            .unwrap()
+            .is_empty());
+        let hist = db::findings_for_resource(&state.pool, &tracked).await.unwrap();
+        assert!(hist
+            .iter()
+            .any(|f| f.close_reason == Some(CloseReason::PackDeactivated)));
+        assert!(db::active_policy_packs(&state.pool).await.unwrap().is_empty());
+
+        // Mutations still need a loopback origin.
+        let bad = Request::builder()
+            .method("POST")
+            .uri("/api/packs/PACK-1/deactivate")
+            .header("x-session-token", &token)
+            .header("origin", "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.clone().oneshot(bad).await.unwrap().status(), StatusCode::FORBIDDEN);
     }
 }

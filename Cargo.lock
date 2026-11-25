@@ -744,6 +744,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "estatetrace-core",
+ "estatetrace-policy",
  "serde",
  "serde_json",
  "sqlx",

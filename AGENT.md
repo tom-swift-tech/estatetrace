@@ -67,8 +67,10 @@ cargo run -p estatetrace -- backup
 ### Policy and inbox
 
 - Evaluate packs deterministically with the limited operators in the kit. Store control **revision** on every evaluation (AC-03).
+- **Findings are intervals** (`finding_intervals`, spec §4.4), not per-scan rows. Write them only through `record_pack_evaluation`, one transaction per pack per scan; an unchanged outcome extends the open interval. Read them through `list_open_findings` / `findings_for_resource`, scoped to tracked subscriptions, never with a global LIMIT. The legacy `evaluations` table is no longer written.
+- **Never close on a partial pass.** Only a subscription whose inventory completed in a pass that started from the beginning may close intervals as `resource_missing` / `no_longer_targeted`. Resumed or failed passes leave intervals open with a stale `last_evaluated_at`.
 - Production classification: missing env tag on a known Prod subscription still shows in Prod (AC-07).
-- “Verified corrected” only after fresh passing evidence; grace periods become actionable after the deadline.
+- Triage is per (resource, control), from the interval: grace runs from `opened_at` and becomes actionable after the deadline; “verified corrected” only when an open pass follows a fail that closed with `state_changed`. Exceptions overlay `fail` only.
 
 ### Connectors and secrets
 

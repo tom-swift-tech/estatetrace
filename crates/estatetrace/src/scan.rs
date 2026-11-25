@@ -1,7 +1,10 @@
 use crate::state::AppState;
 use anyhow::Result;
 use estatetrace_azure::{diff_observations, Collector};
-use estatetrace_core::{classify, ChangeLabel, ClassifyInput, DecisionKind, ResourceId, ResourceObservation};
+use estatetrace_core::{
+    classify, ChangeLabel, ClassifyInput, DecisionKind, ResourceId, ResourceObservation,
+    SubscriptionId,
+};
 use estatetrace_db as db;
 use estatetrace_policy::{
     builtin_resource_kinds, evaluate_pack, parse_pack_json, JoinIndex, PolicyPack,
@@ -43,6 +46,9 @@ pub async fn run_scan_for(state: &AppState, subscription_ids: Option<&[String]>)
     let collector = Collector::new();
     let mut any_error = false;
     let mut all_obs: Vec<ResourceObservation> = Vec::new();
+    // Subscriptions whose inventory completed in a pass that started from the beginning.
+    // Only these may close finding intervals by absence (spec invariant 8, AC-P3-4/5).
+    let mut complete_subscriptions: HashSet<SubscriptionId> = HashSet::new();
 
     for row in &tracked {
         let sub = &row.subscription;
@@ -72,8 +78,11 @@ pub async fn run_scan_for(state: &AppState, subscription_ids: Option<&[String]>)
         )
         .await
         {
-            Ok(resources) => {
-                all_obs.extend(resources);
+            Ok(pass) => {
+                if pass.complete_from_beginning {
+                    complete_subscriptions.insert(sub.id.clone());
+                }
+                all_obs.extend(pass.resources);
                 // P4: refresh resource-group tags (environment fallback + ownership).
                 // Best effort: a failure here never fails the inventory pass.
                 match collector.collect_resource_group_tags(sub.id.as_str()).await {
@@ -101,19 +110,34 @@ pub async fn run_scan_for(state: &AppState, subscription_ids: Option<&[String]>)
         }
     }
 
-    if let Err(e) = evaluate_active_packs(state, &all_obs).await {
-        warn!("evaluation failed: {e}");
-    }
+    // A failed pack write rolls back that pack only; the scan is then partial (spec §7).
+    let eval_error = match evaluate_active_packs(state, &scan_id, &all_obs, &complete_subscriptions)
+        .await
+    {
+        Ok(()) => None,
+        Err(e) => {
+            warn!("evaluation failed: {e}");
+            Some(format!("evaluation failed: {e}"))
+        }
+    };
 
     db::finish_scan_run(
         &state.pool,
         &scan_id,
-        if any_error { "partial" } else { "complete" },
-        None,
+        if any_error || eval_error.is_some() { "partial" } else { "complete" },
+        eval_error.as_deref(),
     )
     .await?;
     info!("scan {scan_id} finished");
     Ok(())
+}
+
+/// Result of one subscription's inventory pass.
+struct SubscriptionPass {
+    resources: Vec<ResourceObservation>,
+    /// The page sequence completed and started from the beginning (no resume checkpoint),
+    /// so absence from `resources` means absence from the subscription.
+    complete_from_beginning: bool,
 }
 
 /// Page Resource Graph, commit each batch, resume from checkpoint.
@@ -127,7 +151,7 @@ async fn scan_subscription_paged(
     previous: &[ResourceObservation],
     start_checkpoint: Option<String>,
     started_from_beginning: bool,
-) -> Result<Vec<ResourceObservation>> {
+) -> Result<SubscriptionPass> {
     let mut checkpoint = start_checkpoint;
     let mut seen: HashSet<ResourceId> = HashSet::new();
     let mut all_new: Vec<ResourceObservation> = Vec::new();
@@ -195,7 +219,10 @@ async fn scan_subscription_paged(
                 let _ = db::insert_change_event(&state.pool, ch).await?;
             }
 
-            return Ok(all_new);
+            return Ok(SubscriptionPass {
+                resources: all_new,
+                complete_from_beginning: started_from_beginning,
+            });
         }
 
         // Incomplete page — persist checkpoint after batch commit; do not mark_missing.
@@ -216,13 +243,23 @@ async fn scan_subscription_paged(
         }
     }
 
-    Ok(all_new)
+    Ok(SubscriptionPass {
+        resources: all_new,
+        complete_from_beginning: false,
+    })
 }
 
 /// Evaluate every active pack (spec §3.1 `evaluate_pack`): kind-targeted controls, environment
 /// applicability from the classification rules, and coverage gaps for controls that cannot be
-/// judged per resource. Until the findings store lands (P3) results still go to `evaluations`.
-async fn evaluate_active_packs(state: &AppState, resources: &[ResourceObservation]) -> Result<()> {
+/// judged per resource. Results are recorded as finding intervals, one transaction per pack
+/// (spec §3.3 `record_pack_evaluation`). Every pack is attempted; the error lists the packs
+/// whose write failed and rolled back.
+async fn evaluate_active_packs(
+    state: &AppState,
+    scan_id: &str,
+    resources: &[ResourceObservation],
+    complete_subscriptions: &HashSet<SubscriptionId>,
+) -> Result<()> {
     let packs = db::active_policy_packs(&state.pool).await?;
     let rules = db::list_classification_rules(&state.pool).await?;
     // Full classification (subscription-name and resource-group-tag rules), not the
@@ -258,11 +295,7 @@ async fn evaluate_active_packs(state: &AppState, resources: &[ResourceObservatio
     };
     let kinds = builtin_resource_kinds();
     let joins = JoinIndex::build(&db::list_latest_resources(&state.pool).await?);
-    // Every observation in one run carries the run's scan id.
-    let scan_id = resources
-        .first()
-        .map(|o| o.scan_id.clone())
-        .unwrap_or_default();
+    let mut failures: Vec<String> = Vec::new();
     for p in packs {
         let content = p.get("content").cloned().unwrap_or_default();
         let pack_id = p
@@ -283,12 +316,27 @@ async fn evaluate_active_packs(state: &AppState, resources: &[ResourceObservatio
         // The stored row's revision is authoritative for AC-03.
         pack.revision = revision.clone();
         let result = evaluate_pack(&pack, resources, &env_of, kinds, &joins);
-        for ev in &result.evaluations {
-            db::insert_evaluation(&state.pool, ev).await?;
-        }
         let pack_id = if pack_id.is_empty() { pack.id.clone() } else { pack_id };
-        db::replace_coverage_gaps(&state.pool, &pack_id, &revision, &scan_id, &result.coverage_gaps)
-            .await?;
+        match db::record_pack_evaluation(
+            &state.pool,
+            scan_id,
+            &pack_id,
+            &revision,
+            complete_subscriptions,
+            &result,
+        )
+        .await
+        {
+            Ok(stats) => info!(
+                "pack {pack_id} rev {revision}: {} opened, {} continued, {} closed",
+                stats.opened, stats.continued, stats.closed
+            ),
+            Err(e) => failures.push(format!("pack {pack_id}: {e}")),
+        }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
 }

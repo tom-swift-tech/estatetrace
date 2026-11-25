@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, InboxGroup, InboxResponse, InboxRow } from "../api";
+import { api, InboxGroup, InboxResponse, InboxRow, isStale } from "../api";
 
 interface SubscriptionOption {
   subscription: {
@@ -32,6 +32,7 @@ export default function Inbox() {
   );
   const [subscriptions, setSubscriptions] = useState<DiscoveredSubscription[]>([]);
   const [lastVisit, setLastVisit] = useState<string | null>(null);
+  const [lastScanAt, setLastScanAt] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [ask, setAsk] = useState("");
   const [answer, setAnswer] = useState<unknown>(null);
@@ -86,6 +87,7 @@ export default function Inbox() {
       setRows(data.rows || []);
       setGroups(data.groups || []);
       setLastVisit(data.last_visit ?? null);
+      setLastScanAt(data.last_scan_at ?? null);
       setError("");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -348,6 +350,9 @@ export default function Inbox() {
                     <span className={`badge ${r.triage.state}`}>
                       {r.triage.state}
                     </span>
+                    {r.finding && (
+                      <span className="muted"> {r.finding.control_id}</span>
+                    )}
                     <div className="muted">{r.triage.reason}</div>
                     {r.disposition && (
                       <div className="muted">
@@ -357,11 +362,34 @@ export default function Inbox() {
                           : ""}
                       </div>
                     )}
+                    {/* Triage per control: a pass on one never hides a fail on another. */}
+                    {(r.findings || []).length > 1 && (
+                      <div className="finding-list">
+                        {(r.findings || []).map(({ finding: f, triage: t }) => (
+                          <div key={f.id} className="muted">
+                            {f.control_id}:{" "}
+                            <span className={`badge ${t.state}`}>{t.state}</span>
+                            {isStale(f, lastScanAt) && (
+                              <span
+                                className="badge stale"
+                                title={`Last evaluated ${f.last_evaluated_at}, before the last scan`}
+                              >
+                                stale
+                              </span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {r.finding && isStale(r.finding, lastScanAt) && (
+                      <span
+                        className="badge stale"
+                        title={`Last evaluated ${r.finding.last_evaluated_at}, before the last scan`}
+                      >
+                        stale
+                      </span>
+                    )}
                   </>
-                ) : r.evaluation ? (
-                  <span className={`badge ${r.evaluation.outcome}`}>
-                    {r.evaluation.outcome}
-                  </span>
                 ) : (
                   "—"
                 )}

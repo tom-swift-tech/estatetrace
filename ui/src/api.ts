@@ -99,6 +99,91 @@ export function createException(
   return api("/exceptions", { method: "POST", body: JSON.stringify(body) });
 }
 
+/* ---- P3: findings as intervals (spec §4.4) ---- */
+
+export type EvalOutcome = "pass" | "fail" | "unknown" | "inapplicable";
+
+export type CloseReason =
+  | "state_changed"
+  | "pack_revision"
+  | "no_longer_targeted"
+  | "resource_missing"
+  | "pack_deactivated";
+
+/** One outcome of one control on one resource, from opened_at until closed_at. */
+export interface FindingInterval {
+  id: string;
+  pack_id: string;
+  pack_revision: string;
+  clause_revision: string;
+  resource_id: string;
+  subscription_id: string;
+  control_id: string;
+  outcome: EvalOutcome;
+  severity: string;
+  environment: string;
+  detail: string;
+  evidence: Record<string, unknown>;
+  opened_at: string;
+  opened_scan_id: string;
+  last_evaluated_at: string;
+  last_scan_id: string;
+  closed_at: string | null;
+  close_reason: CloseReason | null;
+  grace_period_hours: number | null;
+  predecessor_outcome?: EvalOutcome | null;
+  predecessor_close_reason?: CloseReason | null;
+}
+
+export interface TriagedFinding {
+  finding: FindingInterval;
+  triage: TriageInfo;
+}
+
+export const CLOSE_REASON_LABELS: Record<CloseReason, string> = {
+  state_changed: "outcome changed",
+  pack_revision: "pack revision changed",
+  no_longer_targeted: "control no longer applies",
+  resource_missing: "resource not found by a complete scan",
+  pack_deactivated: "pack deactivated",
+};
+
+/** An open finding the newest scan did not re-evaluate (e.g. after a partial scan). */
+export function isStale(
+  f: Pick<FindingInterval, "closed_at" | "last_evaluated_at">,
+  lastScanAt?: string | null,
+): boolean {
+  if (f.closed_at || !lastScanAt) return false;
+  return new Date(f.last_evaluated_at).getTime() < new Date(lastScanAt).getTime();
+}
+
+export interface FindingQuery {
+  subscription_id?: string;
+  control_id?: string;
+  outcome?: EvalOutcome;
+  environment?: string;
+  lane?: "security" | "hygiene";
+  /** With resource_id the response is that resource's full history (open + closed). */
+  resource_id?: string;
+  limit?: number;
+}
+
+export interface FindingsResponse {
+  findings: FindingInterval[];
+  /** `triage[i]` triages `findings[i]`. */
+  triage: TriageInfo[];
+  last_scan_at?: string | null;
+}
+
+export function listFindings(q: FindingQuery = {}): Promise<FindingsResponse> {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(q)) {
+    if (v !== undefined && v !== null && v !== "") params.set(k, String(v));
+  }
+  const qs = params.toString();
+  return api<FindingsResponse>(`/findings${qs ? `?${qs}` : ""}`);
+}
+
 export interface InboxRow {
   change?: {
     id: string;
@@ -124,14 +209,12 @@ export interface InboxRow {
   ownership?: Ownership;
   /** P4: present when the inbox was requested with `group_by`. */
   group_key?: string | null;
-  evaluation?: {
-    id: string;
-    outcome?: string;
-    severity?: string;
-    control_id?: string;
-    control_revision?: string;
-  };
-  triage?: TriageInfo;
+  /** Most urgent open finding of the resource (row-level summary). */
+  finding?: FindingInterval | null;
+  /** Every open finding of the resource, triaged per control, most urgent first. */
+  findings?: TriagedFinding[];
+  /** Most urgent triage across the resource's controls. */
+  triage?: TriageInfo | null;
   disposition?: {
     owner?: string;
     disposition?: string;
@@ -143,6 +226,8 @@ export interface InboxRow {
 export interface InboxResponse {
   rows: InboxRow[];
   last_visit?: string | null;
+  /** Start of the newest finished scan; an older `last_evaluated_at` is stale. */
+  last_scan_at?: string | null;
   filter?: Record<string, string | null | undefined>;
   groups?: InboxGroup[];
 }
@@ -158,6 +243,10 @@ export interface ComplianceSummary {
   awaiting_grace?: number;
   verified_corrected?: number;
   freshness?: string;
+  /** Start of the newest finished scan. */
+  last_scan_at?: string | null;
+  /** Open findings the newest scan did not re-evaluate. */
+  stale?: number;
   scope?: string[];
   coverage_gaps?: CoverageGap[];
   controls_evaluated?: number;
@@ -204,18 +293,17 @@ export interface ResourceTimeline {
     tags?: Record<string, unknown>;
   };
   changes?: TimelineChange[];
-  evaluations?: Array<{
-    id: string;
-    control_id: string;
-    control_revision: string;
-    outcome: string;
-    severity?: string;
-    evidence?: Record<string, unknown>;
-  }>;
-  triage?: TriageInfo;
+  /** Full interval history of the resource, open and closed. */
+  findings?: FindingInterval[];
+  /** `findings_triage[i]` triages `findings[i]`; null for closed intervals. */
+  findings_triage?: Array<TriageInfo | null>;
+  /** Most urgent triage across the open findings. */
+  triage?: TriageInfo | null;
+  last_scan_at?: string | null;
   exceptions?: ExceptionRecord[];
   dispositions?: Array<{
     id: string;
+    /** Finding interval ID (the column keeps its pre-P3 name). */
     evaluation_id: string;
     owner?: string;
     disposition: string;

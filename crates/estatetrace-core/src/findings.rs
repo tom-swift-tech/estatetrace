@@ -1,8 +1,10 @@
-//! Finding triage: grace → actionable → verified corrected (UI-02 / AC-07).
+//! Findings as intervals (spec §4.4) and their triage: grace → actionable → verified
+//! corrected (UI-02 / AC-07), with the scoped exception overlay (spec §4.5).
 
-use crate::{EvalOutcome, Evaluation};
+use crate::{EnvironmentClass, EvalOutcome, ResourceId, Severity, SubscriptionId};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -196,164 +198,316 @@ pub struct DispositionRecord {
     pub created_at: DateTime<Utc>,
 }
 
-/// Compute operator-facing triage from a single evaluation at `now`.
-pub fn triage_evaluation(ev: &Evaluation, now: DateTime<Utc>) -> TriageInfo {
-    match ev.outcome {
-        EvalOutcome::Inapplicable => TriageInfo {
-            state: TriageState::Inapplicable,
-            grace_deadline: None,
-            grace_period_hours: None,
-            reason: "control not applicable".into(),
-            exception_id: None,
-            exception_expired: false,
-        },
-        EvalOutcome::Pass => TriageInfo {
-            state: TriageState::Pass,
-            grace_deadline: None,
-            grace_period_hours: grace_hours(ev),
-            reason: "passing evidence".into(),
-            exception_id: None,
-            exception_expired: false,
-        },
-        EvalOutcome::Fail | EvalOutcome::Unknown => {
-            let hours = grace_hours(ev);
-            if let Some(h) = hours {
-                let deadline = ev.evaluated_at + Duration::hours(h as i64);
-                if now < deadline {
-                    return TriageInfo {
-                        state: TriageState::AwaitingGrace,
-                        grace_deadline: Some(deadline),
-                        grace_period_hours: hours,
-                        reason: format!("grace until {}", deadline.to_rfc3339()),
-                        exception_id: None,
-                        exception_expired: false,
-                    };
-                }
-                return TriageInfo {
-                    state: TriageState::Actionable,
-                    grace_deadline: Some(deadline),
-                    grace_period_hours: hours,
-                    reason: "grace period elapsed".into(),
-                    exception_id: None,
-                    exception_expired: false,
-                };
-            }
-            TriageInfo {
-                state: if ev.outcome == EvalOutcome::Fail {
-                    TriageState::Actionable
-                } else {
-                    TriageState::Unknown
-                },
-                grace_deadline: None,
-                grace_period_hours: None,
-                reason: if ev.outcome == EvalOutcome::Fail {
-                    "failing without grace".into()
-                } else {
-                    "unknown evidence".into()
-                },
-                exception_id: None,
-                exception_expired: false,
-            }
+/// Why an interval closed (spec §4.4, invariant 8).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseReason {
+    /// The outcome changed; a new interval opened with the new outcome.
+    StateChanged,
+    /// The pack revision changed (on activation or at the next scan).
+    PackRevision,
+    /// The resource was observed by a complete pass but the control no longer selects it.
+    NoLongerTargeted,
+    /// A complete from-the-beginning pass of the subscription did not observe the resource.
+    ResourceMissing,
+    /// The pack was deactivated.
+    PackDeactivated,
+}
+
+impl CloseReason {
+    pub const ALL: [CloseReason; 5] = [
+        CloseReason::StateChanged,
+        CloseReason::PackRevision,
+        CloseReason::NoLongerTargeted,
+        CloseReason::ResourceMissing,
+        CloseReason::PackDeactivated,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CloseReason::StateChanged => "state_changed",
+            CloseReason::PackRevision => "pack_revision",
+            CloseReason::NoLongerTargeted => "no_longer_targeted",
+            CloseReason::ResourceMissing => "resource_missing",
+            CloseReason::PackDeactivated => "pack_deactivated",
         }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        CloseReason::ALL.into_iter().find(|r| r.as_str() == s.trim())
     }
 }
 
-/// Latest eval wins; a fresh Pass after an earlier Fail for the same control
-/// becomes verified_corrected.
-pub fn triage_with_history(evals: &[Evaluation], now: DateTime<Utc>) -> Option<TriageInfo> {
-    if evals.is_empty() {
-        return None;
-    }
-    let mut sorted = evals.to_vec();
-    sorted.sort_by(|a, b| a.evaluated_at.cmp(&b.evaluated_at));
-    let latest = sorted.last()?;
-    let mut info = triage_evaluation(latest, now);
-    if latest.outcome == EvalOutcome::Pass {
-        let had_fail = sorted.iter().any(|e| {
-            e.control_id == latest.control_id && e.outcome == EvalOutcome::Fail
-        });
-        if had_fail {
-            info.state = TriageState::VerifiedCorrected;
-            info.reason = "fresh passing evidence after prior fail".into();
-        }
-    }
-    Some(info)
+/// One stored finding interval: the outcome of one control on one resource from `opened_at`
+/// until `closed_at` (open while `None`). Re-evaluations with the same outcome only move
+/// `last_evaluated_at` / `last_scan_id` (spec §4.4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FindingInterval {
+    pub id: String,
+    pub pack_id: String,
+    pub pack_revision: String,
+    pub clause_revision: String,
+    pub resource_id: ResourceId,
+    pub subscription_id: SubscriptionId,
+    pub control_id: String,
+    pub outcome: EvalOutcome,
+    pub severity: Severity,
+    pub environment: EnvironmentClass,
+    pub detail: String,
+    pub evidence: Value,
+    pub opened_at: DateTime<Utc>,
+    pub opened_scan_id: String,
+    pub last_evaluated_at: DateTime<Utc>,
+    pub last_scan_id: String,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub close_reason: Option<CloseReason>,
+    /// From the evidence (`grace_period_hours` of the control at evaluation time).
+    pub grace_period_hours: Option<u64>,
+    /// Outcome of the previous interval for the same (pack, resource, control), filled by the
+    /// query so triage never scans history (`VerifiedCorrected`, spec §3.2).
+    #[serde(default)]
+    pub predecessor_outcome: Option<EvalOutcome>,
+    /// Close reason of that previous interval.
+    #[serde(default)]
+    pub predecessor_close_reason: Option<CloseReason>,
 }
 
-/// `triage_with_history` plus the exception overlay, keyed on the latest evaluation's
-/// outcome and control. Interim helper until P3's `triage_interval` replaces both.
-pub fn triage_with_exceptions(
-    evals: &[Evaluation],
+impl FindingInterval {
+    pub fn is_open(&self) -> bool {
+        self.closed_at.is_none()
+    }
+}
+
+/// Counts from one `record_pack_evaluation` call.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntervalStats {
+    pub opened: u64,
+    pub continued: u64,
+    pub closed: u64,
+}
+
+/// Filter for `list_open_findings` and `GET /api/findings` (spec §4.4).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FindingQuery {
+    pub subscription_id: Option<String>,
+    pub control_id: Option<String>,
+    pub outcome: Option<EvalOutcome>,
+    pub environment: Option<String>,
+    /// `security` | `hygiene`, matched against the evidence `lane` (a missing lane is
+    /// `security`, the pack default).
+    pub lane: Option<String>,
+    pub resource_id: Option<String>,
+    pub limit: Option<i64>,
+    /// Scope filter (invariant 13): only these subscriptions, case-insensitive. Set by the
+    /// server from `tracked_subscription_ids`, never from the query string.
+    #[serde(skip)]
+    pub subscriptions: Option<Vec<String>>,
+    /// Only these resources (inbox batch lookup). Server-side only.
+    #[serde(skip)]
+    pub resource_ids: Option<Vec<String>>,
+}
+
+/// Operator-facing triage of one interval at `now` (spec §3.2, invariants 9-11).
+///
+/// - Grace runs from `opened_at` of the interval, never from the latest re-evaluation.
+/// - An open pass whose predecessor closed as `fail` with `state_changed` is
+///   `VerifiedCorrected` (fresh passing evidence after a fail).
+/// - The exception overlay applies last, to `fail` only.
+pub fn triage_interval(
+    f: &FindingInterval,
     exceptions: &[ExceptionRecord],
     now: DateTime<Utc>,
-) -> Option<TriageInfo> {
-    let info = triage_with_history(evals, now)?;
-    // Same pick as triage_with_history: the last of the latest evaluations.
-    let latest = evals.iter().max_by(|a, b| a.evaluated_at.cmp(&b.evaluated_at))?;
-    Some(apply_exception(
+) -> TriageInfo {
+    let hours = f.grace_period_hours;
+    let base = |state, deadline, reason: String| TriageInfo {
+        state,
+        grace_deadline: deadline,
+        grace_period_hours: hours,
+        reason,
+        exception_id: None,
+        exception_expired: false,
+    };
+    let info = match f.outcome {
+        EvalOutcome::Inapplicable => TriageInfo {
+            grace_period_hours: None,
+            ..base(TriageState::Inapplicable, None, "control not applicable".into())
+        },
+        EvalOutcome::Pass => {
+            if f.is_open()
+                && f.predecessor_outcome == Some(EvalOutcome::Fail)
+                && f.predecessor_close_reason == Some(CloseReason::StateChanged)
+            {
+                base(
+                    TriageState::VerifiedCorrected,
+                    None,
+                    format!(
+                        "passing since {} after a prior fail",
+                        f.opened_at.to_rfc3339()
+                    ),
+                )
+            } else {
+                base(TriageState::Pass, None, "passing evidence".into())
+            }
+        }
+        EvalOutcome::Fail | EvalOutcome::Unknown => match hours {
+            Some(h) => {
+                let deadline = f.opened_at + Duration::hours(h as i64);
+                if now < deadline {
+                    base(
+                        TriageState::AwaitingGrace,
+                        Some(deadline),
+                        format!("grace until {}", deadline.to_rfc3339()),
+                    )
+                } else {
+                    base(
+                        TriageState::Actionable,
+                        Some(deadline),
+                        format!("grace period elapsed at {}", deadline.to_rfc3339()),
+                    )
+                }
+            }
+            None if f.outcome == EvalOutcome::Fail => {
+                base(TriageState::Actionable, None, "failing without grace".into())
+            }
+            None => base(TriageState::Unknown, None, "unknown evidence".into()),
+        },
+    };
+    apply_exception(
         info,
-        &latest.outcome,
-        &latest.control_id,
-        latest.resource_id.as_str(),
+        &f.outcome,
+        &f.control_id,
+        f.resource_id.as_str(),
         exceptions,
         now,
-    ))
+    )
 }
 
-fn grace_hours(ev: &Evaluation) -> Option<u64> {
-    ev.evidence
-        .get("grace_period_hours")
-        .and_then(|v| v.as_u64())
+/// Urgency rank of a triage state for sorting and "worst of" rollups (lower is more urgent).
+pub fn triage_rank(state: &TriageState) -> u8 {
+    match state {
+        TriageState::Actionable => 0,
+        TriageState::AwaitingGrace => 1,
+        TriageState::Fail | TriageState::Unknown => 2,
+        TriageState::Excepted => 3,
+        TriageState::VerifiedCorrected => 4,
+        TriageState::Pass => 5,
+        TriageState::Inapplicable => 6,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ResourceId, Severity};
     use serde_json::json;
-    use uuid::Uuid;
 
-    fn ev(outcome: EvalOutcome, hours: Option<u64>, at: DateTime<Utc>) -> Evaluation {
-        Evaluation {
-            id: Uuid::new_v4().to_string(),
-            observation_id: "o1".into(),
-            resource_id: ResourceId::new("/subscriptions/s/resourceGroups/rg/providers/x/y"),
+    const RID: &str = "/subscriptions/s/resourceGroups/rg/providers/x/y";
+
+    fn interval(outcome: EvalOutcome, hours: Option<u64>, opened: DateTime<Utc>) -> FindingInterval {
+        FindingInterval {
+            id: "f1".into(),
+            pack_id: "P".into(),
+            pack_revision: "1".into(),
+            clause_revision: "1".into(),
+            resource_id: ResourceId::new(RID),
+            subscription_id: SubscriptionId::new("s"),
             control_id: "FIN-014".into(),
-            control_revision: "1".into(),
             outcome,
             severity: Severity::Medium,
-            evidence: json!({ "grace_period_hours": hours }),
-            evaluated_at: at,
-            environment: crate::EnvironmentClass::Unknown,
+            environment: EnvironmentClass::Prod,
             detail: String::new(),
+            evidence: json!({ "grace_period_hours": hours }),
+            opened_at: opened,
+            opened_scan_id: "scan-1".into(),
+            // Re-evaluated every hour up to now: grace must not move with it.
+            last_evaluated_at: Utc::now(),
+            last_scan_id: "scan-9".into(),
+            closed_at: None,
+            close_reason: None,
+            grace_period_hours: hours,
+            predecessor_outcome: None,
+            predecessor_close_reason: None,
         }
     }
 
     #[test]
-    fn ac07_grace_becomes_actionable_after_deadline() {
-        let start = Utc::now() - Duration::hours(5);
-        let failing = ev(EvalOutcome::Fail, Some(2), start);
-        let info = triage_evaluation(&failing, Utc::now());
-        assert_eq!(info.state, TriageState::Actionable);
+    fn ac_p3_6_grace_runs_from_opened_at_not_latest_evaluation() {
+        let now = Utc::now();
+        let old = interval(EvalOutcome::Fail, Some(2), now - Duration::hours(5));
+        let t = triage_interval(&old, &[], now);
+        assert_eq!(t.state, TriageState::Actionable);
+        assert_eq!(t.grace_deadline, Some(old.opened_at + Duration::hours(2)));
+
+        let fresh = interval(EvalOutcome::Fail, Some(2), now - Duration::hours(1));
+        assert_eq!(triage_interval(&fresh, &[], now).state, TriageState::AwaitingGrace);
     }
 
     #[test]
-    fn ac07_within_grace_awaits() {
-        let start = Utc::now() - Duration::hours(1);
-        let failing = ev(EvalOutcome::Fail, Some(24), start);
-        let info = triage_evaluation(&failing, Utc::now());
-        assert_eq!(info.state, TriageState::AwaitingGrace);
+    fn ac_p3_2_pass_after_state_changed_fail_is_verified_corrected() {
+        let now = Utc::now();
+        let mut f = interval(EvalOutcome::Pass, Some(1), now - Duration::minutes(5));
+        f.predecessor_outcome = Some(EvalOutcome::Fail);
+        f.predecessor_close_reason = Some(CloseReason::StateChanged);
+        assert_eq!(triage_interval(&f, &[], now).state, TriageState::VerifiedCorrected);
+
+        // A fail closed by a pack revision change is not a correction.
+        f.predecessor_close_reason = Some(CloseReason::PackRevision);
+        assert_eq!(triage_interval(&f, &[], now).state, TriageState::Pass);
+
+        // Nor is a pass after an unknown.
+        f.predecessor_outcome = Some(EvalOutcome::Unknown);
+        f.predecessor_close_reason = Some(CloseReason::StateChanged);
+        assert_eq!(triage_interval(&f, &[], now).state, TriageState::Pass);
     }
 
     #[test]
-    fn ac07_verified_corrected_after_fresh_pass() {
-        let t0 = Utc::now() - Duration::hours(3);
-        let t1 = Utc::now() - Duration::minutes(5);
-        let history = vec![
-            ev(EvalOutcome::Fail, Some(1), t0),
-            ev(EvalOutcome::Pass, Some(1), t1),
-        ];
-        let info = triage_with_history(&history, Utc::now()).unwrap();
-        assert_eq!(info.state, TriageState::VerifiedCorrected);
+    fn fail_without_grace_is_actionable_and_unknown_stays_unknown() {
+        let now = Utc::now();
+        let f = interval(EvalOutcome::Fail, None, now);
+        assert_eq!(triage_interval(&f, &[], now).state, TriageState::Actionable);
+        let u = interval(EvalOutcome::Unknown, None, now);
+        assert_eq!(triage_interval(&u, &[], now).state, TriageState::Unknown);
+        let i = interval(EvalOutcome::Inapplicable, Some(4), now);
+        let t = triage_interval(&i, &[], now);
+        assert_eq!(t.state, TriageState::Inapplicable);
+        assert_eq!(t.grace_period_hours, None);
+    }
+
+    #[test]
+    fn exception_overlay_applies_after_grace() {
+        let now = Utc::now();
+        let ex = ExceptionRecord {
+            id: "EX-1".into(),
+            control_id: "fin-014".into(),
+            resource_id: None,
+            subscription_id: Some("s".into()),
+            resource_group: Some("RG".into()),
+            reason: None,
+            approved_by: None,
+            ticket_ref: None,
+            expires_at: None,
+            created_at: now,
+        };
+        let f = interval(EvalOutcome::Fail, Some(2), now - Duration::hours(5));
+        let t = triage_interval(&f, std::slice::from_ref(&ex), now);
+        assert_eq!(t.state, TriageState::Excepted);
+        assert_eq!(t.exception_id.as_deref(), Some("EX-1"));
+        // Pass is untouched by the overlay.
+        let p = interval(EvalOutcome::Pass, None, now);
+        assert_eq!(triage_interval(&p, &[ex], now).state, TriageState::Pass);
+    }
+
+    #[test]
+    fn close_reason_round_trips() {
+        for r in CloseReason::ALL {
+            assert_eq!(CloseReason::parse(r.as_str()), Some(r));
+            assert_eq!(serde_json::to_value(r).unwrap(), json!(r.as_str()));
+        }
+        assert_eq!(CloseReason::parse("nope"), None);
+    }
+
+    #[test]
+    fn triage_rank_puts_actionable_first() {
+        assert!(triage_rank(&TriageState::Actionable) < triage_rank(&TriageState::Pass));
+        assert!(triage_rank(&TriageState::AwaitingGrace) < triage_rank(&TriageState::VerifiedCorrected));
     }
 }
