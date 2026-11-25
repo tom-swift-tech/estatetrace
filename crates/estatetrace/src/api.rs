@@ -404,10 +404,10 @@ async fn resource_timeline(
         .await
         .unwrap_or_default();
     let now = Utc::now();
-    let triage = triage_with_history(&evals, now);
-    let exceptions = db::list_exceptions(&state.pool, Some(&decoded))
+    let exceptions = db::list_exceptions(&state.pool, None, Some(&decoded))
         .await
         .unwrap_or_default();
+    let triage = triage_with_exceptions(&evals, &exceptions, now);
     let mut dispositions = Vec::new();
     for e in &evals {
         if let Ok(Some(d)) = db::latest_disposition_for_evaluation(&state.pool, &e.id).await {
@@ -473,6 +473,9 @@ async fn inbox(
     let evals = db::list_evaluations(&state.pool, 1000)
         .await
         .unwrap_or_default();
+    let exceptions = db::list_exceptions(&state.pool, None, None)
+        .await
+        .unwrap_or_default();
 
     let last_visit = db::meta_get(&state.pool, "last_visit")
         .await
@@ -529,7 +532,7 @@ async fn inbox(
                 continue;
             }
         }
-        let triage = triage_with_history(&resource_evals, now);
+        let triage = triage_with_exceptions(&resource_evals, &exceptions, now);
         let disposition = if let Some(ref ev) = related_eval {
             db::latest_disposition_for_evaluation(&state.pool, &ev.id)
                 .await
@@ -612,9 +615,13 @@ async fn compliance_summary(
         }
     }
     let now = Utc::now();
+    let exception_rows = db::list_exceptions(&state.pool, None, None)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut actionable = 0;
     let mut awaiting_grace = 0;
     let mut verified = 0;
+    let mut excepted = 0;
     // Group by resource+control for triage history
     let mut by_key: std::collections::HashMap<(String, String), Vec<Evaluation>> =
         std::collections::HashMap::new();
@@ -625,18 +632,17 @@ async fn compliance_summary(
             .push(e.clone());
     }
     for (_k, hist) in &by_key {
-        if let Some(info) = triage_with_history(hist, now) {
+        if let Some(info) = triage_with_exceptions(hist, &exception_rows, now) {
             match info.state {
                 TriageState::Actionable => actionable += 1,
                 TriageState::AwaitingGrace => awaiting_grace += 1,
                 TriageState::VerifiedCorrected => verified += 1,
+                TriageState::Excepted => excepted += 1,
                 _ => {}
             }
         }
     }
-    let exceptions = db::count_active_exceptions(&state.pool)
-        .await
-        .unwrap_or(0);
+    let exceptions = exception_rows.iter().filter(|x| x.is_active(now)).count();
 
     Ok(Json(json!({
         "passing": pass,
@@ -644,6 +650,7 @@ async fn compliance_summary(
         "unknown": unknown,
         "inapplicable": inapplicable,
         "exceptions": exceptions,
+        "excepted": excepted,
         "pending_remediation": actionable,
         "awaiting_grace": awaiting_grace,
         "verified_corrected": verified,
@@ -652,43 +659,93 @@ async fn compliance_summary(
     })))
 }
 
+/// Scoped exception request (spec §3.4, §4.5). Scope is `resource_id`, or `subscription_id`,
+/// or `subscription_id` + `resource_group`.
 #[derive(Deserialize)]
 struct ExceptionCreate {
-    resource_id: String,
+    #[serde(default)]
     control_id: String,
+    resource_id: Option<String>,
+    subscription_id: Option<String>,
+    resource_group: Option<String>,
     reason: Option<String>,
     approved_by: Option<String>,
+    ticket_ref: Option<String>,
+    /// RFC 3339, or a date (`YYYY-MM-DD`) meaning the end of that day in UTC.
     expires_at: Option<String>,
+}
+
+fn trimmed(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn parse_exception_expiry(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(d) = DateTime::parse_from_rfc3339(s) {
+        return Some(d.with_timezone(&Utc));
+    }
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(23, 59, 59))
+        .map(|dt| dt.and_utc())
 }
 
 async fn create_exception(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<ExceptionCreate>,
-) -> Result<Json<Value>, StatusCode> {
-    require_mutation(&state, &headers)?;
-    let expires_at = body
-        .expires_at
-        .as_ref()
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|d| d.with_timezone(&Utc));
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    require_mutation(&state, &headers).map_err(|s| (s, Json(json!({}))))?;
+    let bad = |msg: &str| (StatusCode::BAD_REQUEST, Json(json!({ "error": msg })));
+    let control_id = body.control_id.trim().to_string();
+    if control_id.is_empty() {
+        return Err(bad("control_id is required"));
+    }
+    let resource_id = trimmed(body.resource_id);
+    let (subscription_id, resource_group) = if resource_id.is_some() {
+        // A resource scope is exact; subscription and group would be ignored, so drop them.
+        (None, None)
+    } else {
+        (trimmed(body.subscription_id), trimmed(body.resource_group))
+    };
+    if resource_id.is_none() && subscription_id.is_none() {
+        return Err(bad(
+            "scope is empty: set resource_id, or subscription_id (optionally with resource_group)",
+        ));
+    }
+    let expires_at = match trimmed(body.expires_at) {
+        None => None,
+        Some(s) => Some(
+            parse_exception_expiry(&s)
+                .ok_or_else(|| bad("expires_at must be RFC 3339 or YYYY-MM-DD"))?,
+        ),
+    };
+    let now = Utc::now();
     let ex = ExceptionRecord {
         id: Uuid::new_v4().to_string(),
-        resource_id: body.resource_id,
-        control_id: body.control_id,
-        reason: body.reason,
-        approved_by: body.approved_by,
+        control_id,
+        resource_id,
+        subscription_id,
+        resource_group,
+        reason: trimmed(body.reason),
+        approved_by: trimmed(body.approved_by),
+        ticket_ref: trimmed(body.ticket_ref),
         expires_at,
-        created_at: Utc::now(),
+        created_at: now,
     };
-    db::insert_exception(&state.pool, &ex)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(json!({ "exception": ex })))
+    db::insert_exception(&state.pool, &ex).await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "store error" })),
+        )
+    })?;
+    // Spec §7: an expiry already in the past is accepted (backfill) but never overlays.
+    let expired = !ex.is_active(now);
+    Ok(Json(json!({ "exception": ex, "expired": expired })))
 }
 
 #[derive(Deserialize)]
 struct ExceptionListQuery {
+    control_id: Option<String>,
     resource_id: Option<String>,
 }
 
@@ -698,9 +755,13 @@ async fn list_exceptions_api(
     Query(q): Query<ExceptionListQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     require_session(&state, &headers)?;
-    let rows = db::list_exceptions(&state.pool, q.resource_id.as_deref())
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = db::list_exceptions(
+        &state.pool,
+        q.control_id.as_deref(),
+        q.resource_id.as_deref(),
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "exceptions": rows })))
 }
 
@@ -1843,5 +1904,199 @@ mod auth_tests {
         assert!(is_loopback_origin("http://127.0.0.1:8787"));
         assert!(is_loopback_origin("http://localhost"));
         assert!(is_loopback_origin("http://[::1]"));
+    }
+}
+
+#[cfg(test)]
+mod exception_tests {
+    //! P2: `POST /api/exceptions` (spec §3.4, AC-P2-5, §7 expired-at-creation row).
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    const SUB: &str = "11111111-2222-3333-4444-555555555555";
+
+    async fn app() -> (axum::Router, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = AppState::bootstrap_in(dir.path().to_path_buf())
+            .await
+            .expect("bootstrap");
+        let token = state.session_token.clone();
+        let _kept = dir.keep();
+        (router(state), token)
+    }
+
+    async fn call(
+        app: &axum::Router,
+        token: &str,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-session-token", token)
+            .header("origin", "http://127.0.0.1:8787");
+        let body = match body {
+            Some(b) => {
+                req = req.header("content-type", "application/json");
+                Body::from(b.to_string())
+            }
+            None => Body::empty(),
+        };
+        let res = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn ac_p2_5_post_exception_without_scope_returns_400() {
+        let (app, token) = app().await;
+        for body in [
+            json!({ "control_id": "STG-001" }),
+            json!({ "control_id": "STG-001", "resource_id": "  ", "subscription_id": "" }),
+            json!({ "control_id": "STG-001", "resource_group": "rg-app" }),
+        ] {
+            let (status, out) =
+                call(&app, &token, "POST", "/api/exceptions", Some(body.clone())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(out["error"].as_str().unwrap().contains("scope"), "{out}");
+        }
+        let (_, listed) = call(&app, &token, "GET", "/api/exceptions", None).await;
+        assert_eq!(listed["exceptions"].as_array().unwrap().len(), 0, "nothing stored");
+    }
+
+    #[tokio::test]
+    async fn post_exception_rejects_missing_control_and_bad_expiry() {
+        let (app, token) = app().await;
+        let (s, _) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/exceptions",
+            Some(json!({ "subscription_id": SUB })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/exceptions",
+            Some(json!({ "control_id": "C", "subscription_id": SUB, "expires_at": "next tuesday" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_scoped_exception_and_list_by_covered_resource() {
+        let (app, token) = app().await;
+        let (s, out) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/exceptions",
+            Some(json!({
+                "control_id": "STG-001",
+                "subscription_id": SUB,
+                "resource_group": "rg-app",
+                "ticket_ref": "CHG0042",
+                "expires_at": "2099-12-31"
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{out}");
+        assert_eq!(out["expired"], json!(false));
+        assert_eq!(out["exception"]["resource_id"], Value::Null);
+        assert_eq!(out["exception"]["resource_group"], json!("rg-app"));
+        assert_eq!(out["exception"]["ticket_ref"], json!("CHG0042"));
+
+        let inside = format!(
+            "/subscriptions/{SUB}/resourceGroups/RG-APP/providers/Microsoft.Storage/storageAccounts/st1"
+        );
+        let outside = format!(
+            "/subscriptions/{SUB}/resourceGroups/rg-other/providers/Microsoft.Storage/storageAccounts/st2"
+        );
+        let enc = |s: &str| s.replace('/', "%2F");
+        let (_, hit) = call(
+            &app,
+            &token,
+            "GET",
+            &format!("/api/exceptions?resource_id={}", enc(&inside)),
+            None,
+        )
+        .await;
+        assert_eq!(hit["exceptions"].as_array().unwrap().len(), 1);
+        let (_, miss) = call(
+            &app,
+            &token,
+            "GET",
+            &format!("/api/exceptions?resource_id={}", enc(&outside)),
+            None,
+        )
+        .await;
+        assert_eq!(miss["exceptions"].as_array().unwrap().len(), 0);
+        let (_, by_control) =
+            call(&app, &token, "GET", "/api/exceptions?control_id=STG-002", None).await;
+        assert_eq!(by_control["exceptions"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn past_expiry_is_accepted_but_flagged_expired() {
+        let (app, token) = app().await;
+        let (s, out) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/exceptions",
+            Some(json!({
+                "control_id": "STG-001",
+                "resource_id": "/subscriptions/x/resourceGroups/rg/providers/a/b/c",
+                "subscription_id": SUB,
+                "expires_at": "2020-01-01T00:00:00Z"
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(out["expired"], json!(true));
+        // A resource scope drops the redundant subscription so the stored shape is exact.
+        assert_eq!(out["exception"]["subscription_id"], Value::Null);
+
+        let (_, summary) = call(&app, &token, "GET", "/api/compliance", None).await;
+        assert_eq!(summary["exceptions"], json!(0), "expired exceptions are not active");
+        assert_eq!(summary["excepted"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn post_exception_requires_session_and_loopback_origin() {
+        let (app, token) = app().await;
+        let body = json!({ "control_id": "C", "subscription_id": SUB }).to_string();
+        let unauth = Request::builder()
+            .method("POST")
+            .uri("/api/exceptions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauth).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let bad_origin = Request::builder()
+            .method("POST")
+            .uri("/api/exceptions")
+            .header("content-type", "application/json")
+            .header("x-session-token", &token)
+            .header("origin", "https://evil.example")
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(bad_origin).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
     }
 }

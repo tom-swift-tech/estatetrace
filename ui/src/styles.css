@@ -116,6 +116,7 @@ th { background: #e4e7eb; font-weight: 600; }
 .badge.awaiting_grace { background: #fefcbf; color: var(--et-unknown); }
 .badge.actionable { background: #fed7d7; color: var(--et-fail); }
 .badge.verified_corrected { background: #c6f6d5; color: var(--et-pass); }
+.badge.excepted { background: #e6fffa; color: #285e61; border: 1px dashed #4fd1c5; }
 .badge.since { background: #e9d8fd; color: #553c9a; margin-top: 0.25rem; }
 .badge.prod { background: #bee3f8; color: #2a4365; }
 .badge.track { background: #c6f6d5; color: #276749; }
