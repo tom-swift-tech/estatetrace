@@ -87,7 +87,7 @@ fn ac_p7_4_fixture_compiles_and_passes_validate_pack() {
     let (pack, issues) = compile(FIX_CATALOG, FIX_MAP, FIX_SETTINGS);
     assert!(errors(&issues).is_empty(), "{issues:#?}");
     assert_eq!(pack.id, "EXAMPLE-WORKPLACE-CATALOG");
-    assert_eq!(pack.revision, "2.1");
+    assert!(pack.revision.starts_with("2.1+"), "revision {}", pack.revision);
     assert_eq!(pack.owner.as_deref(), Some("Example Cloud Governance Office"));
     let ids: Vec<&str> = pack.controls.iter().map(|c| c.id.as_str()).collect();
     assert_eq!(
@@ -597,4 +597,19 @@ fn fixture_is_fictional() {
         assert!(!text.contains(&tag_prefix), "invariant 15");
         assert!(!text.to_ascii_uppercase().contains(&catalog_prefix), "invariant 15");
     }
+}
+
+#[test]
+fn check_map_edit_under_same_catalog_version_changes_pack_revision() {
+    let (a, _) = compile(FIX_CATALOG, FIX_MAP, FIX_SETTINGS);
+    let edited_map = format!("{FIX_MAP}\n# reviewed\n");
+    let (same, _) = compile(FIX_CATALOG, &edited_map, FIX_SETTINGS);
+    // A comment does not change the parsed map, so the revision is stable.
+    assert_eq!(a.revision, same.revision);
+    let edited_settings =
+        FIX_SETTINGS.replacen("[Disabled, EnabledForClientsOnly]", "[Disabled]", 1);
+    assert_ne!(edited_settings, FIX_SETTINGS, "fixture settings changed");
+    let (b, _) = compile(FIX_CATALOG, FIX_MAP, &edited_settings);
+    assert_ne!(a.revision, b.revision, "settings change must produce a new pack revision");
+    assert!(b.revision.starts_with("2.1+"));
 }

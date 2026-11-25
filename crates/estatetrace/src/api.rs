@@ -2867,7 +2867,7 @@ mod compile_api_tests {
         assert_eq!(s, StatusCode::OK, "{imported}");
         assert_eq!(imported["activated"], json!(true), "{imported}");
         assert_eq!(imported["id"], json!("EXAMPLE-WORKPLACE-CATALOG"));
-        assert_eq!(imported["revision"], json!("2.1"));
+        assert!(imported["revision"].as_str().unwrap().starts_with("2.1+"));
         assert_eq!(pack_count(&app, &token).await, before + 1);
     }
 

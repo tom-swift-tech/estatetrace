@@ -408,12 +408,17 @@ pub fn compile_check_map(
     let version = ["catalog_version", "version", "revision"]
         .iter()
         .find_map(|k| scalar_at(&header, k).or_else(|| scalar_at(catalog, k)));
+    // The pack revision must change whenever the compiled logic can change, not only when the
+    // catalog's own version does: a check-map or settings edit under the same catalog version
+    // would otherwise overwrite the stored pack and merge findings across logic (AC-03, spec
+    // invariant 12). The catalog version stays readable as the prefix; clause revisions on each
+    // control still carry the catalog version alone.
+    let text = serde_json::to_string(&(catalog, map, settings))?;
+    let digest = fnv1a64(text.as_bytes());
+    let clause_revision = version.clone();
     let revision = match version {
-        Some(v) => v,
-        None => {
-            let text = serde_json::to_string(&(catalog, map, settings))?;
-            format!("c-{:016x}", fnv1a64(text.as_bytes()))
-        }
+        Some(v) => format!("{v}+{:08x}", digest as u32),
+        None => format!("c-{digest:016x}"),
     };
     let title = str_at(&header, "title")
         .or_else(|| str_at(catalog, "title"))
@@ -535,7 +540,8 @@ pub fn compile_check_map(
         }
         let source = ControlSource {
             document: src_doc.unwrap_or_else(|| catalog_document.clone()),
-            revision: revision.clone(),
+            // Clause revision is the catalog's own version; the pack revision adds the map hash.
+            revision: clause_revision.clone().unwrap_or_else(|| revision.clone()),
             clause: src_section.unwrap_or_else(|| control_id.to_string()),
         };
 
