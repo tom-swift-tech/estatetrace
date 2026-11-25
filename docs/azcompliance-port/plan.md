@@ -1,5 +1,15 @@
 # Plan: Port the azcompliance evaluation engine
 
+> **Status (2026-11-25):** P0–P7 implemented and merged on `port/base`. 174 tests pass, the UI
+> builds and there are no clippy errors. Task 7.4 (private parity run against the FNF catalogs)
+> is operator-run and not done. Migration numbers as shipped: 002 coverage_gaps,
+> 003 exception_scope, 004 classification, 005 observation_arm_meta, 006 findings. Deviations
+> are recorded in the merge commits and team reports. Follow-ups:
+> - drop the legacy `evaluations` table
+> - add `lane` to `InboxFilter` so it becomes part of saved views
+> - add an optional `title` field on `Control`
+> - add a fake-collector test that drives the P5.1 drop guard through `scan.rs`
+
 Contract: [spec.md](spec.md). Each task lists files, the spec ACs it closes, and its verification.
 Run `cargo test -p <crate>` while iterating and `cargo test --workspace` at the end of each phase.
 UI tasks finish with `cd ui && npm run build` and then a binary rebuild.
