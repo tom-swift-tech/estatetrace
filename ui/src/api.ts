@@ -55,13 +55,48 @@ export type TriageState =
   | "inapplicable"
   | "awaiting_grace"
   | "actionable"
-  | "verified_corrected";
+  | "verified_corrected"
+  | "excepted";
 
 export interface TriageInfo {
   state: TriageState;
   grace_deadline?: string | null;
   grace_period_hours?: number | null;
   reason: string;
+  exception_id?: string | null;
+  exception_expired?: boolean;
+}
+
+/** Scoped exception (spec §4.5): resource_id, or subscription_id (+ resource_group). */
+export interface ExceptionRecord {
+  id: string;
+  control_id: string;
+  resource_id?: string | null;
+  subscription_id?: string | null;
+  resource_group?: string | null;
+  reason?: string | null;
+  approved_by?: string | null;
+  ticket_ref?: string | null;
+  expires_at?: string | null;
+  created_at?: string;
+}
+
+export interface ExceptionCreate {
+  control_id: string;
+  resource_id?: string | null;
+  subscription_id?: string | null;
+  resource_group?: string | null;
+  reason?: string | null;
+  approved_by?: string | null;
+  ticket_ref?: string | null;
+  /** RFC 3339, or YYYY-MM-DD (end of that day, UTC). */
+  expires_at?: string | null;
+}
+
+export function createException(
+  body: ExceptionCreate,
+): Promise<{ exception: ExceptionRecord; expired: boolean }> {
+  return api("/exceptions", { method: "POST", body: JSON.stringify(body) });
 }
 
 export interface InboxRow {
@@ -106,6 +141,7 @@ export interface ComplianceSummary {
   unknown: number;
   inapplicable: number;
   exceptions: number;
+  excepted?: number;
   pending_remediation: number;
   awaiting_grace?: number;
   verified_corrected?: number;
@@ -145,13 +181,7 @@ export interface ResourceTimeline {
     evidence?: Record<string, unknown>;
   }>;
   triage?: TriageInfo;
-  exceptions?: Array<{
-    id: string;
-    control_id: string;
-    reason?: string;
-    approved_by?: string;
-    expires_at?: string | null;
-  }>;
+  exceptions?: ExceptionRecord[];
   dispositions?: Array<{
     id: string;
     evaluation_id: string;

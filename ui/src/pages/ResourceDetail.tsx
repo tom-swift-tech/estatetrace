@@ -1,6 +1,38 @@
 import { FormEvent, useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
-import { api, apiBlob, ResourceTimeline, TimelineChange } from "../api";
+import {
+  api,
+  apiBlob,
+  createException,
+  ExceptionRecord,
+  ResourceTimeline,
+  TimelineChange,
+} from "../api";
+
+type ExceptionScope = "resource" | "resource_group" | "subscription";
+
+/** Subscription and resource group from an ARM ID (case-insensitive segment names). */
+function armScope(resourceId: string): { sub: string; rg: string } {
+  const segs = resourceId.split("/").filter(Boolean);
+  if (segs.length < 2 || segs[0].toLowerCase() !== "subscriptions") {
+    return { sub: "", rg: "" };
+  }
+  const rg =
+    segs.length >= 4 && segs[2].toLowerCase() === "resourcegroups"
+      ? segs[3]
+      : "";
+  return { sub: segs[1], rg };
+}
+
+function describeScope(x: ExceptionRecord): string {
+  if (x.resource_id) return "this resource";
+  if (x.resource_group) return `resource group ${x.resource_group}`;
+  return `subscription ${x.subscription_id}`;
+}
+
+function isExpired(x: ExceptionRecord): boolean {
+  return !!x.expires_at && new Date(x.expires_at).getTime() < Date.now();
+}
 
 function DiffTable({ change }: { change: TimelineChange }) {
   const diffs = change.property_diffs || {};
@@ -57,10 +89,13 @@ export default function ResourceDetail() {
   });
   const [ex, setEx] = useState({
     control_id: "",
+    scope: "resource" as ExceptionScope,
     reason: "",
     approved_by: "",
+    ticket_ref: "",
     expires_at: "",
   });
+  const scopeIds = armScope(id);
 
   async function load() {
     try {
@@ -100,17 +135,27 @@ export default function ResourceDetail() {
 
   async function submitException(e: FormEvent) {
     e.preventDefault();
-    await api("/exceptions", {
-      method: "POST",
-      body: JSON.stringify({
-        resource_id: id,
+    try {
+      const res = await createException({
         control_id: ex.control_id,
+        resource_id: ex.scope === "resource" ? id : null,
+        subscription_id: ex.scope === "resource" ? null : scopeIds.sub,
+        resource_group: ex.scope === "resource_group" ? scopeIds.rg : null,
         reason: ex.reason || null,
         approved_by: ex.approved_by || null,
+        ticket_ref: ex.ticket_ref || null,
         expires_at: ex.expires_at || null,
-      }),
-    });
-    setMsg("Exception saved");
+      });
+      setMsg(
+        res.expired
+          ? "Exception saved, but its expiry is in the past so it does not apply"
+          : "Exception saved",
+      );
+    } catch (err: unknown) {
+      setMsg(
+        `Exception not saved: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     await load();
   }
 
@@ -127,6 +172,9 @@ export default function ResourceDetail() {
             {data.triage.state}
           </span>{" "}
           <span className="muted">{data.triage.reason}</span>
+          {data.triage.exception_expired && (
+            <span className="muted"> · exception expired</span>
+          )}
         </div>
       )}
       {msg && <div className="muted">{msg}</div>}
@@ -227,6 +275,21 @@ export default function ResourceDetail() {
             onChange={(e) => setEx({ ...ex, control_id: e.target.value })}
             required
           />
+          <label>Scope</label>
+          <select
+            value={ex.scope}
+            onChange={(e) =>
+              setEx({ ...ex, scope: e.target.value as ExceptionScope })
+            }
+          >
+            <option value="resource">This resource only</option>
+            <option value="resource_group" disabled={!scopeIds.rg}>
+              Resource group {scopeIds.rg || "(none)"}
+            </option>
+            <option value="subscription" disabled={!scopeIds.sub}>
+              Subscription {scopeIds.sub || "(none)"}
+            </option>
+          </select>
           <label>Reason</label>
           <input
             value={ex.reason}
@@ -237,9 +300,14 @@ export default function ResourceDetail() {
             value={ex.approved_by}
             onChange={(e) => setEx({ ...ex, approved_by: e.target.value })}
           />
-          <label>Expires at (RFC3339)</label>
+          <label>Ticket ref</label>
           <input
-            placeholder="2027-01-01T00:00:00Z"
+            value={ex.ticket_ref}
+            onChange={(e) => setEx({ ...ex, ticket_ref: e.target.value })}
+          />
+          <label>Expires on (end of day, UTC; blank for no expiry)</label>
+          <input
+            type="date"
             value={ex.expires_at}
             onChange={(e) => setEx({ ...ex, expires_at: e.target.value })}
           />
@@ -249,8 +317,10 @@ export default function ResourceDetail() {
         </form>
         {(data.exceptions || []).map((x) => (
           <div key={x.id} className="muted">
-            {x.control_id}: {x.reason || "—"}
+            {x.control_id} · {describeScope(x)}: {x.reason || "—"}
+            {x.ticket_ref ? ` · ${x.ticket_ref}` : ""}
             {x.expires_at ? ` · expires ${x.expires_at}` : " · no expiry"}
+            {isExpired(x) ? " · expired" : ""}
           </div>
         ))}
       </div>
