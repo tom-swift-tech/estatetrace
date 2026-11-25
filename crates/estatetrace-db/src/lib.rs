@@ -1,7 +1,9 @@
 //! SQLite persistence for EstateTrace.
 
+mod findings;
 mod repo;
 
+pub use findings::*;
 pub use repo::*;
 
 use anyhow::{Context, Result};
@@ -18,7 +20,11 @@ pub async fn open_db(path: &Path) -> Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(&url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        // Findings staging (`record_pack_evaluation`) uses a temp table; keep it in memory,
+        // and give each connection a 64 MB page cache so a pack's open intervals stay cached.
+        .pragma("temp_store", "memory")
+        .pragma("cache_size", "-65536");
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
@@ -38,6 +44,7 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
     (3, include_str!("../migrations/003_exception_scope.sql")),
     (4, include_str!("../migrations/004_classification.sql")),
     (5, include_str!("../migrations/005_observation_arm_meta.sql")),
+    (6, include_str!("../migrations/006_findings.sql")),
 ];
 
 pub async fn migrate(pool: &SqlitePool) -> Result<()> {

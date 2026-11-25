@@ -7,6 +7,7 @@ edition.workspace = true
 anyhow = { workspace = true }
 chrono = { workspace = true }
 estatetrace-core = { workspace = true }
+estatetrace-policy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }

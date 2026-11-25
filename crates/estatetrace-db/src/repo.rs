@@ -856,6 +856,29 @@ pub async fn save_policy_pack(
     Ok(())
 }
 
+/// Make `revision` the only active revision of pack `id`, or deactivate every revision when
+/// `revision` is `None`. Returns the revisions that were active before, so the caller can
+/// close findings when the active revision changes (spec §3.3 `close_findings_for_pack`).
+pub async fn set_pack_active_revision(
+    pool: &SqlitePool,
+    id: &str,
+    revision: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut tx = pool.begin().await?;
+    let before: Vec<(String,)> =
+        sqlx::query_as("SELECT revision FROM policy_packs WHERE id = ? AND activated = 1")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+    sqlx::query("UPDATE policy_packs SET activated = CASE WHEN ?2 IS NOT NULL AND revision = ?2 THEN 1 ELSE 0 END WHERE id = ?1")
+        .bind(id)
+        .bind(revision)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(before.into_iter().map(|r| r.0).collect())
+}
+
 pub async fn list_policy_packs(pool: &SqlitePool) -> Result<Vec<Value>> {
     let rows = sqlx::query_as::<
         _,
@@ -900,6 +923,10 @@ pub async fn active_policy_packs(pool: &SqlitePool) -> Result<Vec<Value>> {
         .collect())
 }
 
+/// Legacy per-scan evaluation row. Nothing writes it since P3: findings are intervals in
+/// `finding_intervals` ([`crate::record_pack_evaluation`]). The table is kept until a later
+/// migration drops it (spec §8.2).
+#[deprecated(note = "findings are intervals: use record_pack_evaluation")]
 pub async fn insert_evaluation(pool: &SqlitePool, ev: &Evaluation) -> Result<()> {
     sqlx::query(
         "INSERT INTO evaluations(id, observation_id, resource_id, control_id, control_revision, outcome, severity, evidence_json, evaluated_at)
@@ -919,6 +946,8 @@ pub async fn insert_evaluation(pool: &SqlitePool, ev: &Evaluation) -> Result<()>
     Ok(())
 }
 
+/// Legacy reader with a global LIMIT, which truncates history. No caller remains.
+#[deprecated(note = "use list_open_findings or findings_for_resource")]
 pub async fn list_evaluations(pool: &SqlitePool, limit: i64) -> Result<Vec<Evaluation>> {
     let rows = sqlx::query_as::<
         _,
@@ -1566,9 +1595,23 @@ pub async fn replace_coverage_gaps(
     gaps: &[CoverageGap],
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
+    replace_coverage_gaps_in(&mut tx, pack_id, pack_revision, scan_id, gaps).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// [`replace_coverage_gaps`] on an open connection or transaction (used by
+/// `record_pack_evaluation` so gaps and intervals commit together).
+pub(crate) async fn replace_coverage_gaps_in(
+    conn: &mut sqlx::SqliteConnection,
+    pack_id: &str,
+    pack_revision: &str,
+    scan_id: &str,
+    gaps: &[CoverageGap],
+) -> Result<()> {
     sqlx::query("DELETE FROM coverage_gaps WHERE pack_id = ?")
         .bind(pack_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     for g in gaps {
         sqlx::query(
@@ -1589,10 +1632,9 @@ pub async fn replace_coverage_gaps(
         .bind(&g.note)
         .bind(g.resource_count as i64)
         .bind(scan_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 
