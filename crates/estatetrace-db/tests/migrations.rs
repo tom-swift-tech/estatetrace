@@ -38,6 +38,25 @@ async fn ac_p0_1_migrations_apply_once_and_record_version() {
 }
 
 #[tokio::test]
+async fn lower_numbered_migration_merged_later_still_applies() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = db::open_db(&dir.path().join("o.db")).await.unwrap();
+    let base = db::schema_version(&pool).await.unwrap();
+    let hi = [(base + 2, "CREATE TABLE t_hi (id INTEGER)")];
+    db::apply_migrations(&pool, &hi).await.unwrap();
+    // A branch merged afterwards adds a lower number.
+    let both = [(base + 1, "CREATE TABLE t_lo (id INTEGER)"), (base + 2, "CREATE TABLE t_hi (id INTEGER)")];
+    db::apply_migrations(&pool, &both).await.unwrap();
+    let lo: Option<(String,)> =
+        sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' AND name='t_lo'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert!(lo.is_some(), "lower-numbered migration must still run");
+    assert_eq!(db::schema_version(&pool).await.unwrap(), base + 2);
+}
+
+#[tokio::test]
 async fn ac_p0_2_failed_migration_rolls_back() {
     let dir = tempfile::tempdir().unwrap();
     let pool = db::open_db(&dir.path().join("f.db")).await.unwrap();

@@ -46,20 +46,38 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
     apply_migrations(pool, MIGRATIONS).await
 }
 
-/// Current schema version (1 when only `001_init.sql` has been applied).
+/// Highest applied migration version (1 when only `001_init.sql` has been applied).
 pub async fn schema_version(pool: &SqlitePool) -> Result<i64> {
-    Ok(meta_get(pool, "schema_version")
-        .await?
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1))
+    ensure_migration_table(pool).await?;
+    let row: (Option<i64>,) = sqlx::query_as("SELECT MAX(version) FROM schema_migrations")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0.unwrap_or(1))
 }
 
-/// Apply each `(version, sql)` whose version exceeds the stored schema version.
-/// A failing migration rolls back entirely and leaves the version unchanged.
+async fn ensure_migration_table(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Apply each `(version, sql)` not yet recorded in `schema_migrations`, in ascending order.
+/// Tracking each version (not just the maximum) means a migration merged later with a lower
+/// number still runs on a DB that already has higher ones. A failing migration rolls back
+/// entirely and is not recorded.
 pub async fn apply_migrations(pool: &SqlitePool, migrations: &[(i64, &str)]) -> Result<()> {
-    let mut current = schema_version(pool).await?;
-    for (version, sql) in migrations {
-        if *version <= current {
+    ensure_migration_table(pool).await?;
+    let applied: Vec<(i64,)> = sqlx::query_as("SELECT version FROM schema_migrations")
+        .fetch_all(pool)
+        .await?;
+    let applied: std::collections::HashSet<i64> = applied.into_iter().map(|r| r.0).collect();
+    let mut ordered: Vec<&(i64, &str)> = migrations.iter().collect();
+    ordered.sort_by_key(|m| m.0);
+    for (version, sql) in ordered {
+        if applied.contains(version) {
             continue;
         }
         let mut tx = pool.begin().await?;
@@ -71,16 +89,13 @@ pub async fn apply_migrations(pool: &SqlitePool, migrations: &[(i64, &str)]) -> 
                 )
             })?;
         }
-        sqlx::query(
-            "INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        )
-        .bind(version.to_string())
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("INSERT INTO schema_migrations(version, applied_at) VALUES(?, datetime('now'))")
+            .bind(version)
+            .execute(&mut *tx)
+            .await?;
         tx.commit()
             .await
             .with_context(|| format!("migration {version:03} commit failed"))?;
-        current = *version;
     }
     Ok(())
 }
