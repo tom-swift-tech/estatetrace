@@ -3,10 +3,14 @@ import { useLocation } from "react-router-dom";
 import {
   api,
   apiBlob,
+  CLOSE_REASON_LABELS,
   createException,
   ExceptionRecord,
+  FindingInterval,
+  isStale,
   ResourceTimeline,
   TimelineChange,
+  TriageInfo,
 } from "../api";
 
 type ExceptionScope = "resource" | "resource_group" | "subscription";
@@ -32,6 +36,86 @@ function describeScope(x: ExceptionRecord): string {
 
 function isExpired(x: ExceptionRecord): boolean {
   return !!x.expires_at && new Date(x.expires_at).getTime() < Date.now();
+}
+
+/** One interval: "fail since <opened_at> (rev 3)", plus the close reason when closed. */
+function FindingRow({
+  f,
+  triage,
+  lastScanAt,
+  onDispose,
+}: {
+  f: FindingInterval;
+  triage: TriageInfo | null;
+  lastScanAt?: string | null;
+  onDispose: (f: FindingInterval) => void;
+}) {
+  const open = !f.closed_at;
+  return (
+    <div style={{ marginTop: "0.4rem" }} className={open ? "" : "muted"}>
+      <span className={`badge ${f.outcome}`}>{f.outcome}</span> since{" "}
+      {f.opened_at}{" "}
+      <span className="muted">
+        (rev {f.pack_revision}
+        {f.clause_revision && f.clause_revision !== f.pack_revision
+          ? `, clause ${f.clause_revision}`
+          : ""}
+        )
+      </span>
+      {open ? (
+        <>
+          {triage && (
+            <>
+              {" "}
+              <span className={`badge ${triage.state}`}>{triage.state}</span>{" "}
+              <span className="muted">{triage.reason}</span>
+            </>
+          )}
+          {isStale(f, lastScanAt) && (
+            <span
+              className="badge stale"
+              title="Not re-evaluated by the last scan (for example a partial scan)"
+            >
+              stale: last evaluated {f.last_evaluated_at}
+            </span>
+          )}
+          <button
+            className="secondary"
+            style={{ marginLeft: "0.5rem" }}
+            onClick={() => onDispose(f)}
+          >
+            Dispose
+          </button>
+        </>
+      ) : (
+        <>
+          {" "}
+          until {f.closed_at}{" "}
+          <span className="badge closed">
+            {f.close_reason
+              ? CLOSE_REASON_LABELS[f.close_reason] ?? f.close_reason
+              : "closed"}
+          </span>
+        </>
+      )}
+      {f.detail && <div className="muted">{f.detail}</div>}
+    </div>
+  );
+}
+
+/** Intervals grouped by pack and control, newest first (server order). */
+function groupFindings(
+  findings: FindingInterval[],
+  triage: Array<TriageInfo | null>,
+): [string, Array<[FindingInterval, TriageInfo | null]>][] {
+  const groups = new Map<string, Array<[FindingInterval, TriageInfo | null]>>();
+  findings.forEach((f, i) => {
+    const key = `${f.control_id} · ${f.pack_id}`;
+    const list = groups.get(key) ?? [];
+    list.push([f, triage[i] ?? null]);
+    groups.set(key, list);
+  });
+  return [...groups.entries()];
 }
 
 function DiffTable({ change }: { change: TimelineChange }) {
@@ -103,10 +187,11 @@ export default function ResourceDetail() {
         `/resources/${encodeURIComponent(id)}/timeline`,
       );
       setData(d);
-      const firstEval = d.evaluations?.[0];
-      if (firstEval) {
-        setDisp((s) => ({ ...s, evaluation_id: firstEval.id }));
-        setEx((s) => ({ ...s, control_id: firstEval.control_id }));
+      // Default to the first open finding (most recent interval of the first control).
+      const firstOpen = (d.findings || []).find((f) => !f.closed_at);
+      if (firstOpen) {
+        setDisp((s) => ({ ...s, evaluation_id: firstOpen.id }));
+        setEx((s) => ({ ...s, control_id: firstOpen.control_id }));
       }
       setError("");
     } catch (e: unknown) {
@@ -197,31 +282,43 @@ export default function ResourceDetail() {
       </div>
 
       <div className="panel">
-        <strong>Evaluations</strong>
-        {(data.evaluations || []).map((e) => (
-          <div key={e.id} style={{ marginTop: "0.5rem" }}>
-            {e.control_id}@{e.control_revision}:{" "}
-            <span className={`badge ${e.outcome}`}>{e.outcome}</span>
-            <button
-              className="secondary"
-              style={{ marginLeft: "0.5rem" }}
-              onClick={() =>
-                setDisp((s) => ({
-                  ...s,
-                  evaluation_id: e.id,
-                }))
-              }
-            >
-              Dispose
-            </button>
-          </div>
-        ))}
+        <strong>Findings</strong>
+        <div className="muted">
+          Each line is one interval of a control's outcome. Re-evaluations with
+          the same outcome extend it; a change, a pack revision or the resource
+          leaving scope closes it.
+          {data.last_scan_at ? ` Last scan started ${data.last_scan_at}.` : ""}
+        </div>
+        {groupFindings(data.findings || [], data.findings_triage || []).map(
+          ([key, items]) => (
+            <div key={key} style={{ marginTop: "0.75rem" }}>
+              <div>
+                <strong>{key}</strong>
+              </div>
+              {items.map(([f, t]) => (
+                <FindingRow
+                  key={f.id}
+                  f={f}
+                  triage={t}
+                  lastScanAt={data.last_scan_at}
+                  onDispose={(x) => {
+                    setDisp((s) => ({ ...s, evaluation_id: x.id }));
+                    setEx((s) => ({ ...s, control_id: x.control_id }));
+                  }}
+                />
+              ))}
+            </div>
+          ),
+        )}
+        {!data.findings?.length && (
+          <div className="muted">No findings recorded for this resource.</div>
+        )}
       </div>
 
       <div className="panel">
         <strong>Record disposition</strong>
         <form onSubmit={submitDisposition}>
-          <label>Evaluation ID</label>
+          <label>Finding ID</label>
           <input
             value={disp.evaluation_id}
             onChange={(e) =>

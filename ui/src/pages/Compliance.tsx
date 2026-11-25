@@ -143,8 +143,14 @@ export default function Compliance() {
           </div>
         </div>
         <div className="panel">
-          <div className="muted">Freshness</div>
-          <div>{data.freshness}</div>
+          <div className="muted">Last scan</div>
+          <div>{data.last_scan_at ?? "never"}</div>
+          {(data.stale ?? 0) > 0 && (
+            <div className="muted">
+              <span className="badge stale">{data.stale} stale</span> open
+              findings were not re-evaluated by the last scan
+            </div>
+          )}
         </div>
       </div>
       <NotEvaluated data={data} />
