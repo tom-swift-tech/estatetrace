@@ -53,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/packs", get(list_packs).post(import_pack))
         .route("/packs/pilot", post(load_pilot))
         .route("/packs/validate", post(validate_pack))
+        .route("/packs/compile", post(compile_pack))
         .route("/exports/preview", post(export_preview))
         .route("/exports", get(list_exports_api).post(create_export))
         .route("/exports/{id}/state", post(update_export))
@@ -2708,5 +2709,247 @@ mod classification_api_tests {
             .map(|s| s["name"].as_str().unwrap())
             .collect();
         assert_eq!(tokenless, vec!["Products-Shared"]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7: check-map compile (spec §3.4, §4.8, §7 "check-map compile with error issues")
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CompilePackReq {
+    catalog: String,
+    check_map: String,
+    #[serde(default)]
+    settings: Option<String>,
+}
+
+/// `POST /api/packs/compile`: catalog + check map (+ settings), all YAML or JSON text, to a
+/// pack. Returns `{ pack, issues }`; 422 with the full issue list (and `pack: null`) when any
+/// issue is an error. Nothing is saved: the UI imports the pack through `POST /api/packs`.
+async fn compile_pack(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CompilePackReq>,
+) -> Result<axum::response::Response, StatusCode> {
+    use estatetrace_policy::{
+        compile_check_map, parse_catalog, parse_check_map_yaml, parse_compile_settings,
+        LintIssue, LintSeverity,
+    };
+    require_mutation(&state, &headers)?;
+    let rejected = |issues: Vec<LintIssue>| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "pack": Value::Null, "issues": issues })),
+        )
+            .into_response()
+    };
+    let input_error = |e: anyhow::Error| LintIssue {
+        severity: LintSeverity::Error,
+        control_id: None,
+        message: format!("{e:#}"),
+    };
+    let mut input_issues = Vec::new();
+    let catalog = parse_catalog(&req.catalog)
+        .map_err(|e| input_issues.push(input_error(e)))
+        .ok();
+    let map = parse_check_map_yaml(&req.check_map)
+        .map_err(|e| input_issues.push(input_error(e)))
+        .ok();
+    let settings = parse_compile_settings(req.settings.as_deref().unwrap_or(""))
+        .map_err(|e| input_issues.push(input_error(e)))
+        .ok();
+    let (Some(catalog), Some(map), Some(settings)) = (catalog, map, settings) else {
+        return Ok(rejected(input_issues));
+    };
+    let (pack, issues) =
+        match compile_check_map(&catalog, &map, &settings, builtin_resource_kinds()) {
+            Ok(x) => x,
+            Err(e) => return Ok(rejected(vec![input_error(e)])),
+        };
+    if issues.iter().any(|i| i.severity == LintSeverity::Error) {
+        return Ok(rejected(issues));
+    }
+    Ok(Json(json!({ "pack": pack, "issues": issues })).into_response())
+}
+
+/// Phase 7 API tests (AC-P7-1, AC-P7-4, §7 compile row). Fictional fixture only.
+#[cfg(test)]
+mod compile_api_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    const CATALOG: &str =
+        include_str!("../../../kits/policy-authoring/examples/check_map/catalog.yaml");
+    const MAP: &str =
+        include_str!("../../../kits/policy-authoring/examples/check_map/check_map.yaml");
+    const SETTINGS: &str =
+        include_str!("../../../kits/policy-authoring/examples/check_map/settings.yaml");
+
+    async fn app() -> (axum::Router, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = AppState::bootstrap_in(dir.path().to_path_buf())
+            .await
+            .expect("bootstrap");
+        let token = state.session_token.clone();
+        let _kept = dir.keep();
+        (router(state), token)
+    }
+
+    async fn call(
+        app: &axum::Router,
+        token: &str,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-session-token", token)
+            .header("origin", "http://127.0.0.1:8787");
+        let body = match body {
+            Some(b) => {
+                req = req.header("content-type", "application/json");
+                Body::from(b.to_string())
+            }
+            None => Body::empty(),
+        };
+        let res = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    async fn pack_count(app: &axum::Router, token: &str) -> usize {
+        let (_, packs) = call(app, token, "GET", "/api/packs", None).await;
+        packs["packs"].as_array().map(|a| a.len()).unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn ac_p7_4_compiled_pack_imports_through_api_packs() {
+        let (app, token) = app().await;
+        let before = pack_count(&app, &token).await;
+        let (s, out) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/packs/compile",
+            Some(json!({ "catalog": CATALOG, "check_map": MAP, "settings": SETTINGS })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{out}");
+        assert_eq!(out["pack"]["id"], json!("EXAMPLE-WORKPLACE-CATALOG"));
+        assert_eq!(out["pack"]["controls"].as_array().unwrap().len(), 5);
+        let issues = out["issues"].as_array().unwrap();
+        assert!(issues.iter().all(|i| i["severity"] == json!("warning")), "{out}");
+        assert!(issues
+            .iter()
+            .any(|i| i["message"].as_str().unwrap().contains("verified: false")));
+        assert_eq!(pack_count(&app, &token).await, before, "compile saves nothing");
+
+        // Import the compiled pack the way the UI does.
+        let (s, imported) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/packs",
+            Some(json!({
+                "json": out["pack"].to_string(),
+                "reviewed_by": "operator",
+                "activate": true
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{imported}");
+        assert_eq!(imported["activated"], json!(true), "{imported}");
+        assert_eq!(imported["id"], json!("EXAMPLE-WORKPLACE-CATALOG"));
+        assert_eq!(imported["revision"], json!("2.1"));
+        assert_eq!(pack_count(&app, &token).await, before + 1);
+    }
+
+    #[tokio::test]
+    async fn compile_with_error_issues_returns_422_and_saves_nothing() {
+        let (app, token) = app().await;
+        let before = pack_count(&app, &token).await;
+        // No settings: expected_setting cannot resolve.
+        let (s, out) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/packs/compile",
+            Some(json!({ "catalog": CATALOG, "check_map": MAP })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
+        assert_eq!(out["pack"], Value::Null);
+        let issues = out["issues"].as_array().unwrap();
+        assert!(issues.iter().any(|i| i["severity"] == json!("error")
+            && i["control_id"] == json!("EXW-AVD-02/pooled")
+            && i["message"].as_str().unwrap().contains("expected_setting")));
+        // The full list: warnings come back beside the errors.
+        assert!(issues.iter().any(|i| i["severity"] == json!("warning")));
+
+        // AC-P7-1 through the API: the unaccounted control is named.
+        let map = MAP
+            .replace("\r\n", "\n")
+            .replace("  EXW-REG-04:\n", "  EXW-OTHER:\n");
+        let (s, out) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/packs/compile",
+            Some(json!({ "catalog": CATALOG, "check_map": map, "settings": SETTINGS })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
+        assert!(out["issues"].as_array().unwrap().iter().any(|i| i["control_id"]
+            == json!("EXW-REG-04")
+            && i["severity"] == json!("error")));
+
+        // Unparseable input is an error issue too, one per bad document.
+        let (s, out) = call(
+            &app,
+            &token,
+            "POST",
+            "/api/packs/compile",
+            Some(json!({ "catalog": "controls: 3", "check_map": "{not yaml" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(out["issues"].as_array().unwrap().len(), 2, "{out}");
+
+        assert_eq!(pack_count(&app, &token).await, before);
+    }
+
+    #[tokio::test]
+    async fn compile_requires_session_and_loopback_origin() {
+        let (app, token) = app().await;
+        let body = json!({ "catalog": CATALOG, "check_map": MAP }).to_string();
+        let unauth = Request::builder()
+            .method("POST")
+            .uri("/api/packs/compile")
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauth).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let bad_origin = Request::builder()
+            .method("POST")
+            .uri("/api/packs/compile")
+            .header("content-type", "application/json")
+            .header("x-session-token", &token)
+            .header("origin", "https://evil.example")
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(bad_origin).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
     }
 }

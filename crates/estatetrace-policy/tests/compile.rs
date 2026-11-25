@@ -294,7 +294,7 @@ fn scalar_setting_is_wrapped_for_list_operators() {
 
 #[test]
 fn target_filter_plus_variant_filter_is_an_error() {
-    let map = FIX_MAP.replace(
+    let map = FIX_MAP.replace("\r\n", "\n").replace(
         "        name: public network access\n",
         "        name: public network access\n        filter: { path: location, expected: westeurope }\n",
     );
