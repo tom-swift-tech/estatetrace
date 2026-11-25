@@ -30,21 +30,74 @@ pub async fn open_db(path: &Path) -> Result<SqlitePool> {
     Ok(pool)
 }
 
+/// Versioned migrations applied after `001_init.sql`, in ascending order.
+/// Each runs once, inside a transaction, when `meta.schema_version` is below its number.
+/// Add new entries at the end; never edit or renumber an entry that has shipped.
+pub const MIGRATIONS: &[(i64, &str)] = &[];
+
 pub async fn migrate(pool: &SqlitePool) -> Result<()> {
+    // 001 is idempotent (CREATE ... IF NOT EXISTS) and runs on every open.
     let sql = include_str!("../migrations/001_init.sql");
-    // Execute statement-by-statement for SQLite compatibility.
     for stmt in split_sql(sql) {
-        sqlx::query(stmt).execute(pool).await.with_context(|| {
+        sqlx::query(&stmt).execute(pool).await.with_context(|| {
             format!("migration statement failed: {}", &stmt[..stmt.len().min(80)])
         })?;
+    }
+    apply_migrations(pool, MIGRATIONS).await
+}
+
+/// Current schema version (1 when only `001_init.sql` has been applied).
+pub async fn schema_version(pool: &SqlitePool) -> Result<i64> {
+    Ok(meta_get(pool, "schema_version")
+        .await?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1))
+}
+
+/// Apply each `(version, sql)` whose version exceeds the stored schema version.
+/// A failing migration rolls back entirely and leaves the version unchanged.
+pub async fn apply_migrations(pool: &SqlitePool, migrations: &[(i64, &str)]) -> Result<()> {
+    let mut current = schema_version(pool).await?;
+    for (version, sql) in migrations {
+        if *version <= current {
+            continue;
+        }
+        let mut tx = pool.begin().await?;
+        for stmt in split_sql(sql) {
+            sqlx::query(&stmt).execute(&mut *tx).await.with_context(|| {
+                format!(
+                    "migration {version:03} failed at: {}",
+                    &stmt[..stmt.len().min(80)]
+                )
+            })?;
+        }
+        sqlx::query(
+            "INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(version.to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit()
+            .await
+            .with_context(|| format!("migration {version:03} commit failed"))?;
+        current = *version;
     }
     Ok(())
 }
 
-fn split_sql(sql: &str) -> Vec<&str> {
-    sql.split(';')
+/// Split a SQL script into statements. Full-line `--` comments are removed first so a
+/// statement preceded by a comment is not dropped. Statements must not contain `;` in literals.
+fn split_sql(sql: &str) -> Vec<String> {
+    let without_comments: String = sql
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    without_comments
+        .split(';')
         .map(str::trim)
-        .filter(|s| !s.is_empty() && !s.starts_with("--"))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
         .collect()
 }
 
